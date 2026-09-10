@@ -1,0 +1,1065 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>caspr agent harness</title>
+<style>
+  :root {
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --panel3:#222b38; --border:#2b3440;
+    --text:#e6edf3; --dim:#8b949e; --accent:#58a6ff; --green:#3fb950; --yellow:#d29922;
+    --magenta:#bc8cff; --red:#f85149; --cyan:#39c5cf; --orange:#db6d28;
+  }
+  * { box-sizing:border-box; }
+  /* The page owns the viewport: header + trace are fixed-height rows and `main`
+     takes the rest. Measuring those rows in CSS (calc(100vh - 46px - 33px)) broke
+     as soon as the header wrapped to a second line and pushed the composer off. */
+  body { margin:0; background:var(--bg); color:var(--text); overflow:hidden;
+         height:100vh; display:flex; flex-direction:column;
+         font:13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+  /* ── header ─────────────────────────────────────────────── */
+  header { display:flex; flex-wrap:wrap; gap:8px 12px; align-items:center; flex:none;
+           padding:7px 14px; background:var(--panel); border-bottom:1px solid var(--border); }
+  header h1 { font-size:13px; margin:0; font-weight:700; letter-spacing:.3px; }
+  .spacer { flex:1; }
+  .pill { padding:2px 8px; border-radius:999px; border:1px solid var(--border);
+          background:var(--panel2); font-size:11px; white-space:nowrap; }
+  .pill.on { color:var(--green); border-color:var(--green); }
+  .pill.off { color:var(--dim); }
+  .pill.warn { color:var(--orange); border-color:var(--orange); }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%;
+         background:var(--red); margin-right:5px; vertical-align:middle; }
+  .dot.live { background:var(--green); }
+  .dot.busy { background:var(--yellow); animation:pulse 1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
+
+  button, input, textarea, select { font:inherit; color:var(--text); }
+  button { background:var(--panel2); border:1px solid var(--border); border-radius:6px;
+           padding:4px 10px; cursor:pointer; }
+  button:hover:not(:disabled) { border-color:var(--accent); }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  button.primary { background:var(--accent); color:#0d1117; border-color:var(--accent); font-weight:700; }
+  button.danger { color:var(--red); border-color:var(--red); }
+  button.sm { padding:1px 7px; font-size:11px; }
+  input[type=text], textarea, select { background:var(--panel2); border:1px solid var(--border);
+                     border-radius:6px; padding:4px 8px; }
+  textarea { resize:none; }
+  .tabs { display:flex; gap:0; border:1px solid var(--border); border-radius:6px; overflow:hidden; }
+  .tabs button { border:0; border-radius:0; padding:4px 14px; background:var(--panel2); }
+  .tabs button.sel { background:var(--accent); color:#0d1117; font-weight:700; }
+
+  /* ── trace strip ─────────────────────────────────────────── */
+  #trace { display:flex; align-items:center; gap:6px; padding:5px 14px; min-height:32px; flex:none;
+           background:var(--panel2); border-bottom:1px solid var(--border);
+           overflow-x:auto; white-space:nowrap; }
+  #trace .lab { color:var(--dim); font-size:10px; text-transform:uppercase;
+                letter-spacing:1px; flex:none; }
+  .chip { flex:none; padding:2px 9px; border-radius:5px; border:1px solid var(--border);
+          background:var(--panel); font-size:11px; }
+  .chip.cur { border-color:var(--accent); color:var(--accent); font-weight:700;
+              box-shadow:0 0 0 1px var(--accent) inset; animation:pulse 1.4s infinite; }
+  .chip.done { color:var(--green); border-color:#255d3a; }
+  .chip .t { color:var(--dim); margin-left:5px; font-size:10px; }
+  .arrow { color:var(--dim); flex:none; font-size:11px; }
+
+  /* ── layout ─────────────────────────────────────────────── */
+  main { display:none; grid-template-columns:1.15fr 1fr 1.05fr; gap:1px;
+         background:var(--border); flex:1; min-height:0; }
+  main.sel { display:grid; }
+  section.col { background:var(--bg); display:flex; flex-direction:column;
+                min-width:0; min-height:0; }
+  .col > h2 { margin:0; padding:6px 12px; font-size:11px; text-transform:uppercase;
+              letter-spacing:1px; color:var(--dim); background:var(--panel); flex:none;
+              border-bottom:1px solid var(--border); display:flex; gap:8px;
+              justify-content:space-between; align-items:center; }
+  .col > h2 .r { display:flex; gap:6px; align-items:center; text-transform:none;
+                 letter-spacing:0; }
+  .scroll { overflow-y:auto; overflow-x:hidden; padding:10px 12px; flex:1; min-height:0; }
+  .empty { color:var(--dim); font-style:italic; padding:14px 2px; }
+
+  /* ── chat ───────────────────────────────────────────────── */
+  .msg { margin-bottom:12px; }
+  .msg .who { font-size:10px; text-transform:uppercase; letter-spacing:1px;
+              color:var(--dim); margin-bottom:3px; }
+  .msg.user .who { color:var(--cyan); }
+  .msg.assistant .who { color:var(--green); }
+  .msg .body { white-space:pre-wrap; word-break:break-word; background:var(--panel);
+               border:1px solid var(--border); border-radius:6px; padding:7px 9px; }
+  .msg.user .body { background:var(--panel2); }
+  .askbody { border-color:var(--yellow) !important; }
+  .ask-lead { color:var(--yellow); margin-bottom:5px; }
+  .ask-opts { margin:0; padding:0; list-style:none; }
+  .ask-opts li { display:flex; gap:7px; padding:3px 0; align-items:baseline; }
+  .ask-opts .opt { padding:0 7px; border-color:var(--yellow); color:var(--yellow); }
+  .ask-opts .opt:hover { background:var(--yellow); color:#0d1117; }
+  .ask-busy { display:none; margin-top:7px; padding-top:6px; font-size:11px; color:var(--dim);
+              border-top:1px dotted var(--border); }
+  .sessionbreak { border:1px solid var(--red); border-radius:6px; padding:8px 10px;
+                  margin:14px 0; background:var(--panel); color:var(--red); }
+  .sessionbreak .sub { color:var(--dim); margin:5px 0 7px; }
+  .turnbar { text-align:center; color:var(--dim); font-size:11px; margin:12px 0;
+             border-top:1px dashed var(--border); padding-top:6px; }
+  .turnbar b { color:var(--text); }
+  .badge { padding:1px 6px; border-radius:4px; border:1px solid var(--border); }
+  .badge.green { color:var(--green); border-color:#255d3a; }
+  .badge.mag { color:var(--magenta); border-color:#4d3a70; }
+  .badge.warnbadge { color:var(--orange); border-color:var(--orange); }
+  .composer { display:flex; gap:7px; padding:9px 12px; border-top:1px solid var(--border);
+              background:var(--panel); flex:none; }
+  .composer textarea { flex:1; height:52px; }
+  #queued { display:none; gap:8px; align-items:center; flex:none; padding:5px 12px;
+            background:var(--panel2); border-top:1px solid var(--yellow);
+            color:var(--yellow); font-size:11px; }
+  #queued .qtext { flex:1; color:var(--text); overflow:hidden;
+                   text-overflow:ellipsis; white-space:nowrap; }
+
+  /* report-config panel */
+  .cfg { border:1px solid var(--yellow); border-radius:6px; padding:9px; margin-bottom:12px;
+         background:var(--panel); }
+  .cfg h3 { margin:0 0 7px; font-size:11px; color:var(--yellow); text-transform:uppercase;
+            letter-spacing:1px; }
+  .cfg .row { display:flex; gap:8px; align-items:center; margin-bottom:6px; }
+  .cfg label { color:var(--dim); font-size:11px; min-width:52px; }
+
+  /* ── layout cards ───────────────────────────────────────── */
+  .lcard { border:1px solid var(--border); border-radius:6px; margin-bottom:8px;
+           background:var(--panel); overflow:hidden; }
+  .lcard .h { padding:5px 9px; background:var(--panel2); font-weight:700;
+              border-bottom:1px solid var(--border); display:flex; gap:7px;
+              align-items:center; justify-content:space-between; }
+  .lcard ul { margin:0; padding:6px 9px 8px 26px; color:var(--dim); }
+  .lcard li { padding:1px 0; }
+  .lcard.structural { opacity:.62; }
+  .lcard.structural .h { font-weight:400; }
+  .lcard .csum { padding:5px 9px; color:var(--dim); border-top:1px dotted var(--border); }
+  .rq { border:1px solid var(--magenta); border-radius:6px; margin-bottom:8px;
+        background:var(--panel); overflow:hidden; }
+  .rq .h { padding:4px 9px; background:var(--panel2); color:var(--magenta);
+           display:flex; gap:8px; align-items:baseline;
+           border-bottom:1px solid var(--border); }
+  .rq .h .n { font-weight:700; }
+  .rq .h .t { margin-left:auto; color:var(--dim); font-size:10px; }
+  .rq .req { padding:5px 9px; white-space:pre-wrap; word-break:break-word; }
+  .rq .tgt { padding:3px 9px; color:var(--cyan); font-size:11px;
+             border-top:1px dotted var(--border); }
+  .rq pre { margin:0; padding:6px 9px; border-top:1px solid var(--border);
+            white-space:pre-wrap; word-break:break-word; color:var(--dim);
+            font-size:11px; max-height:260px; overflow:auto; }
+  .rq.pending { border-color:var(--yellow); }
+  .rq.pending .h { color:var(--yellow); }
+  .tier { display:flex; gap:6px; margin-bottom:8px; }
+  .tier button.sel { background:var(--accent); color:#0d1117; border-color:var(--accent); }
+  .summary { border-left:2px solid var(--magenta); padding:4px 9px; margin-bottom:9px;
+             color:var(--magenta); background:var(--panel); }
+  pre.md { white-space:pre-wrap; word-break:break-word; background:var(--panel);
+           border:1px solid var(--border); border-radius:6px; padding:8px 10px; margin:0 0 9px; }
+  .rep-step { display:flex; gap:8px; padding:2px 0; border-bottom:1px dotted #222b38; }
+  .rep-step .s { color:var(--cyan); flex:none; min-width:132px; }
+
+  /* ── events ─────────────────────────────────────────────── */
+  .evt { border:1px solid var(--border); border-radius:5px; margin-bottom:5px;
+         background:var(--panel); }
+  .evt > .eh { display:flex; gap:7px; align-items:baseline; padding:3px 8px; cursor:pointer;
+               user-select:none; }
+  .evt > .eh:hover { background:var(--panel2); }
+  .evt .mode { font-size:10px; color:var(--dim); text-transform:uppercase; min-width:56px; }
+  .evt .nm { font-weight:700; }
+  .evt .st { color:var(--dim); font-size:11px; }
+  .evt .ts { margin-left:auto; color:var(--dim); font-size:10px; }
+  .evt pre { margin:0; padding:6px 9px; border-top:1px solid var(--border);
+             white-space:pre-wrap; word-break:break-word; color:var(--dim);
+             max-height:340px; overflow:auto; font-size:11px; }
+  .evt.hot { border-color:var(--magenta); }
+  .evt.hot .nm { color:var(--magenta); }
+  .evt.err { border-color:var(--red); } .evt.err .nm { color:var(--red); }
+  .filters { display:flex; gap:5px; flex-wrap:wrap; }
+  .filters button { font-size:10px; padding:1px 7px; }
+  .filters button.off { opacity:.35; }
+
+  /* ── node mode ──────────────────────────────────────────── */
+  .grp { margin-bottom:11px; }
+  .grp > .gh { font-size:10px; text-transform:uppercase; letter-spacing:1px;
+               color:var(--accent); padding:3px 0 4px; position:sticky; top:-10px;
+               background:var(--bg); }
+  .tgt { display:flex; gap:7px; align-items:center; padding:4px 7px; border-radius:5px;
+         cursor:pointer; border:1px solid transparent; }
+  .tgt:hover { background:var(--panel2); }
+  .tgt.sel { background:var(--panel2); border-color:var(--accent); }
+  .tgt .nm { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .k { font-size:9px; padding:0 5px; border-radius:3px; border:1px solid var(--border);
+       color:var(--dim); text-transform:uppercase; letter-spacing:.5px; flex:none; }
+  .k.node { color:var(--accent); border-color:#1f4c7a; }
+  .k.tool { color:var(--green); border-color:#255d3a; }
+  .k.router { color:var(--yellow); border-color:#5c4712; }
+  .k.helper { color:var(--dim); }
+  .k.func { color:var(--magenta); border-color:#4d3a70; }
+  .warnbar { border:1px solid var(--orange); color:var(--orange); border-radius:5px;
+             padding:4px 8px; margin-bottom:8px; font-size:11px; }
+  .sigbox { background:var(--panel); border:1px solid var(--border); border-radius:6px;
+            padding:7px 9px; margin-bottom:9px; }
+  .sigbox code { color:var(--cyan); word-break:break-all; }
+  .sigbox .doc { color:var(--dim); white-space:pre-wrap; margin-top:6px; font-size:11px;
+                 max-height:180px; overflow:auto; }
+  #argsEditor { width:100%; height:100%; min-height:150px; font-size:12px; }
+  .argwrap { flex:1; display:flex; flex-direction:column; min-height:120px; }
+  .hintrow { display:flex; gap:5px; flex-wrap:wrap; margin:7px 0; align-items:center; }
+  .hintrow code { color:var(--yellow); }
+  .res-ok { color:var(--green); } .res-bad { color:var(--red); }
+  .kv { display:flex; gap:8px; padding:2px 0; }
+  .kv .k2 { color:var(--dim); min-width:70px; flex:none; }
+  label.chk { display:flex; gap:5px; align-items:center; color:var(--dim); font-size:11px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>caspr agent harness</h1>
+  <span class="pill"><span id="dot" class="dot"></span><span id="connTxt">connecting…</span></span>
+  <div class="tabs">
+    <button id="tabFlow" class="sel" onclick="setMode('flow')">flow</button>
+    <button id="tabNode" onclick="setMode('node')">node</button>
+  </div>
+  <span class="pill off" id="pillReport">report OFF</span>
+  <span class="pill off" id="pillDocs">no docs</span>
+  <span class="pill warn" title="generate_report / PR / DD subgraphs are NOT stubbed">real report nodes</span>
+  <span class="pill off" id="pillReportRun" style="display:none">⚙ report generating…</span>
+  <span class="spacer"></span>
+  <span class="pill off" id="pillCore" title=""></span>
+  <button class="sm" onclick="send({type:'scenario'})">load scenario</button>
+  <button class="sm" onclick="toggleReport()">toggle report flag</button>
+  <button class="sm danger" onclick="resetAll()">reset</button>
+</header>
+
+<div id="trace"><span class="lab">node path</span><span class="empty" id="traceEmpty">idle</span></div>
+
+<!-- ══════════════════ FLOW MODE ══════════════════ -->
+<main id="flowMain" class="sel">
+  <section class="col">
+    <h2>chat
+      <span class="r">
+        <span id="histPill" class="pill off" title="messages replayed to the model next turn">history 0</span>
+        <button class="sm" onclick="send({type:'history'})">inspect</button>
+        <span id="turnInfo" class="pill off">no turn yet</span>
+      </span>
+    </h2>
+    <div class="scroll" id="chat"><div class="empty">Send a message to drive a full graph turn.</div></div>
+    <div id="queued"></div>
+    <div class="composer">
+      <textarea id="input" placeholder="message… (Enter to send, Shift+Enter for newline)"></textarea>
+      <button class="primary" id="sendBtn" onclick="sendTurn()">send</button>
+    </div>
+  </section>
+
+  <section class="col">
+    <h2>layout &amp; report
+      <span class="r">
+        <span id="refinePill" class="pill off" title="refine requests routed and queued">refine 0</span>
+        <span id="refreshState" class="pill off">—</span>
+      </span>
+    </h2>
+    <div class="scroll" id="layoutPane"><div class="empty">No layout proposed yet.</div></div>
+  </section>
+
+  <section class="col">
+    <h2>event stream
+      <span class="r">
+        <div class="filters" id="filters"></div>
+        <button class="sm" onclick="clearEvents()">clear</button>
+      </span>
+    </h2>
+    <div class="scroll" id="events"><div class="empty">Events appear here.</div></div>
+  </section>
+</main>
+
+<!-- ══════════════════ NODE MODE ══════════════════ -->
+<main id="nodeMain">
+  <section class="col">
+    <h2>targets <span class="r"><span class="pill off" id="tgtCount">0</span></span></h2>
+    <div style="padding:8px 12px 0"><input type="text" id="tgtSearch" placeholder="filter…"
+      style="width:100%" oninput="renderCatalog()"></div>
+    <div class="scroll" id="catalog"><div class="empty">Waiting for catalog…</div></div>
+  </section>
+
+  <section class="col">
+    <h2>inputs <span class="r"><span class="pill off" id="selKind">—</span></span></h2>
+    <div class="scroll" id="inputPane" style="display:flex; flex-direction:column">
+      <div class="empty">Pick a target on the left.</div>
+    </div>
+    <div class="composer">
+      <label class="chk"><input type="checkbox" id="useSystem" checked> prepend real system message</label>
+      <span class="spacer"></span>
+      <button class="sm" onclick="resetArgs()">reset inputs</button>
+      <button class="primary" id="runBtn" onclick="runNode()" disabled>run</button>
+    </div>
+  </section>
+
+  <section class="col">
+    <h2>result
+      <span class="r">
+        <span class="pill off" id="runTime">—</span>
+        <button class="sm" onclick="document.getElementById('nodeOut').innerHTML=''">clear</button>
+      </span>
+    </h2>
+    <div class="scroll" id="nodeOut"><div class="empty">Run a target to see its return value, events and traceback.</div></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+// ── state ────────────────────────────────────────────────────────────────
+let ws = null, mode = "flow", catalog = [], selected = null, busy = false;
+// Every WebSocket connection builds a FRESH server-side session (new Casper,
+// empty history). The chat pane is client-side, so after an auto-reconnect the
+// transcript still looks intact while the model remembers nothing — which reads
+// exactly like the model "forgetting". Make that discontinuity impossible to miss.
+let everConnected = false, reconnected = false;
+// A report building in the background must NOT gate the composer — while it runs
+// the graph routes follow-ups to `respond_during_report`, so chatting is the
+// intended behaviour, not something to queue.
+let reportRunning = false;
+let curAssistant = null, curTurnPath = [], layoutTiers = {}, activeTier = null;
+const EVT_MODES = ["messages","updates","custom","values"];
+const evtFilter = { messages:false, updates:true, custom:true, values:false };
+const DEFAULT_MESSAGES = [
+  { type:"human", content:"Give me a report on the UK fintech market." }
+];
+
+const $  = (id) => document.getElementById(id);
+const el = (tag, cls, txt) => { const n=document.createElement(tag);
+  if(cls) n.className=cls; if(txt!=null) n.textContent=txt; return n; };
+const esc = (s) => String(s==null?"":s);
+const now = () => new Date().toLocaleTimeString("en-GB",{hour12:false});
+function atBottom(n){ return n.scrollHeight - n.scrollTop - n.clientHeight < 60; }
+function stick(n, was){ if(was) n.scrollTop = n.scrollHeight; }
+
+// ── connection ───────────────────────────────────────────────────────────
+function connect(){
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen  = () => {
+    setConn(true, "live");
+    if(everConnected) reconnected = true;   // the `ready` frame renders the notice
+    everConnected = true;
+  };
+  ws.onclose = () => { setConn(false, "closed — retrying"); setTimeout(connect, 1500); };
+  ws.onerror = () => setConn(false, "error");
+  ws.onmessage = (e) => { try { handle(JSON.parse(e.data)); } catch(err){ console.error(err, e.data); } };
+}
+function setConn(live, txt){
+  $("dot").className = "dot" + (live ? " live" : "");
+  $("connTxt").textContent = txt;
+}
+
+// ── busy clock — say WHAT is running, not just that something is ──────────
+// A turn keeps running after the model stops streaming: report_or_respond
+// awaits the background layout refresh (150s cap) before it returns.
+let busyStart = 0, busyTimer = null, refreshStatus = "";
+function startBusyClock(){ busyStart = Date.now(); clearInterval(busyTimer);
+  busyTimer = setInterval(renderBusyText, 1000); }
+function stopBusyClock(){ clearInterval(busyTimer); busyTimer = null; renderBusyText(); }
+function busyReason(){
+  if(refreshStatus === "running") return "waiting: background layout refresh";
+  const chips = $("trace").querySelectorAll(".chip.cur");
+  const cur = chips[chips.length - 1];
+  return cur ? "in " + cur.dataset.node : "";
+}
+function renderBusyText(){
+  if(!busy){ $("connTxt").textContent = "live"; return; }
+  const secs = Math.round((Date.now() - busyStart) / 1000);
+  const why = busyReason();
+  $("connTxt").textContent = `running ${secs}s` + (why ? " · " + why : "");
+}
+function send(obj){
+  if(!ws || ws.readyState !== 1){ return; }
+  ws.send(JSON.stringify(obj));
+}
+
+// ── mode switching ───────────────────────────────────────────────────────
+function setMode(m){
+  mode = m;
+  $("tabFlow").classList.toggle("sel", m==="flow");
+  $("tabNode").classList.toggle("sel", m==="node");
+  $("flowMain").classList.toggle("sel", m==="flow");
+  $("nodeMain").classList.toggle("sel", m==="node");
+}
+
+// ── trace strip ──────────────────────────────────────────────────────────
+function traceReset(label){
+  curTurnPath = [];
+  const t = $("trace");
+  t.innerHTML = "";
+  t.appendChild(el("span","lab", label || "node path"));
+  t.appendChild(el("span","empty","running…"));
+}
+function traceIdle(){
+  const t = $("trace");
+  t.innerHTML = ""; t.appendChild(el("span","lab","node path"));
+  t.appendChild(el("span","empty","idle"));
+}
+function traceAppend(node, elapsed, running){
+  const t = $("trace");
+  const stale = t.querySelector(".empty"); if(stale) stale.remove();
+  t.querySelectorAll(".chip.cur").forEach(c => { c.classList.remove("cur"); c.classList.add("done"); });
+  if(curTurnPath.length) t.appendChild(el("span","arrow","→"));
+  const chip = el("span","chip cur"); chip.dataset.node = node;
+  chip.appendChild(el("span",null,node));
+  if(elapsed != null) chip.appendChild(el("span","t", elapsed+"s"));
+  if(!running) { chip.classList.remove("cur"); chip.classList.add("done"); }
+  t.appendChild(chip);
+  curTurnPath.push(node);
+  t.scrollLeft = t.scrollWidth;
+  return chip;
+}
+// A node that has STARTED (its tokens are streaming) but has not returned yet.
+function traceActive(node, elapsed){
+  const chips = $("trace").querySelectorAll(".chip");
+  const last = chips[chips.length - 1];
+  if(last && last.dataset.node === node && last.classList.contains("cur")) return;
+  traceAppend(node, elapsed, true);
+}
+// A node that has RETURNED (its `updates` frame landed).
+function tracePush(node, elapsed){
+  const chips = $("trace").querySelectorAll(".chip");
+  const last = chips[chips.length - 1];
+  if(last && last.dataset.node === node){
+    last.classList.remove("cur"); last.classList.add("done");
+    const t = last.querySelector(".t");
+    if(elapsed != null){
+      if(t) t.textContent = elapsed + "s";
+      else last.appendChild(el("span","t", elapsed + "s"));
+    }
+    curTurnPath.push(node);
+    return;
+  }
+  traceAppend(node, elapsed, false);
+}
+function traceFinish(){
+  $("trace").querySelectorAll(".chip.cur").forEach(c => { c.classList.remove("cur"); c.classList.add("done"); });
+}
+
+// ── flow: chat rendering ─────────────────────────────────────────────────
+function chatClearEmpty(){ const e = $("chat").querySelector(".empty"); if(e) e.remove(); }
+function addMsg(role, text, who){
+  chatClearEmpty();
+  const pane = $("chat"), was = atBottom(pane);
+  const m = el("div", "msg " + role);
+  m.appendChild(el("div","who", who || role));
+  m.appendChild(el("div","body", esc(text)));
+  pane.appendChild(m); stick(pane, was);
+  return m;
+}
+function addAskUser(questions){
+  chatClearEmpty();
+  const pane = $("chat"), was = atBottom(pane);
+  const m = el("div","msg assistant");
+  m.appendChild(el("div","who","ask_user"));
+  const body = el("div","body askbody");
+  body.appendChild(el("div","ask-lead","Pick one — click, or just type your answer:"));
+  const ul = el("ul","ask-opts");
+  questions.forEach((q,i) => {
+    const li = el("li");
+    const b = el("button","opt sm", String(i+1));
+    b.onclick = () => sendTurn(q);
+    li.appendChild(b);
+    const lbl = el("span",null,q);
+    lbl.style.cursor = "pointer";
+    lbl.onclick = () => sendTurn(q);
+    li.appendChild(lbl);
+    ul.appendChild(li);
+  });
+  const note = el("div","ask-busy",
+    "the turn is still finishing (background layout refresh) — pick anyway, "
+    + "your answer is queued and sent automatically");
+  body.appendChild(ul); body.appendChild(note);
+  m.appendChild(body); pane.appendChild(m); stick(pane, was);
+  syncAskBusy();
+}
+// The ask_user options render mid-turn, up to ~150s before turn_end, so say so
+// rather than letting the page look stuck.
+function syncAskBusy(){
+  document.querySelectorAll(".ask-busy").forEach(n => { n.style.display = busy ? "" : "none"; });
+}
+function addReportConfig(p){
+  chatClearEmpty();
+  const pane = $("chat"), was = atBottom(pane);
+  const box = el("div","cfg");
+  box.appendChild(el("h3","","report configuration required"));
+  const tiers = p.tiers && p.tiers.length ? p.tiers : ["study","brief"];
+  const styles = p.styles && p.styles.length ? p.styles : ["investor"];
+  const r1 = el("div","row"); r1.appendChild(el("label",null,"tier"));
+  const selT = el("select"); tiers.forEach(t => { const o=el("option",null,t); o.value=t;
+    if(t===p.default_tier) o.selected=true; selT.appendChild(o); }); r1.appendChild(selT);
+  const r2 = el("div","row"); r2.appendChild(el("label",null,"style"));
+  const selS = el("select"); styles.forEach(s => { const o=el("option",null,s); o.value=s; selS.appendChild(o); });
+  r2.appendChild(selS);
+  const r3 = el("div","row"); r3.appendChild(el("label",null,"language"));
+  const inL = el("input"); inL.type="text"; inL.value="English"; r3.appendChild(inL);
+  const btn = el("button","primary","confirm");
+  btn.onclick = () => {
+    btn.disabled = true; selT.disabled = selS.disabled = inL.disabled = true;
+    send({ type:"confirm_report_config", report_tier:selT.value,
+           style:selS.value, language:inL.value });
+  };
+  box.appendChild(r1); box.appendChild(r2); box.appendChild(r3);
+  box.appendChild(btn);
+  pane.appendChild(box); stick(pane, was);
+}
+// Drawn when the socket comes back on a NEW server session, so it is obvious the
+// messages above are no longer in the model's context.
+function addSessionBreak(){
+  const pane = $("chat");
+  if(pane.querySelector(".empty")) pane.innerHTML = "";
+  const bar = el("div","sessionbreak");
+  bar.appendChild(el("div", null, "⚠  reconnected to a NEW server session"));
+  bar.appendChild(el("div","sub",
+    "The messages above are still on screen but are NOT in the model's context — "
+    + "server-side history and the Casper instance were rebuilt. Start again from here."));
+  const b = el("button","sm","clear the stale transcript");
+  b.onclick = () => resetAll();
+  bar.appendChild(b);
+  pane.appendChild(bar);
+  pane.scrollTop = pane.scrollHeight;
+  layoutTiers = {}; activeTier = null;
+  $("turnInfo").textContent = "no turn yet"; $("turnInfo").className = "pill off";
+  traceIdle();
+}
+
+function addTurnBar(d){
+  const pane = $("chat"), was = atBottom(pane);
+  const bar = el("div","turnbar");
+  bar.appendChild(el("span",null,"handled by "));
+  const b = el("b",null, d.handled_by || "?"); bar.appendChild(b);
+  if(d.elapsed != null) bar.appendChild(el("span",null, `  ·  ${d.elapsed}s`));
+  // Why a turn took as long as it did: LLM work vs the graph waiting on
+  // something (almost always the background layout refresh).
+  if(d.waiting_seconds != null && d.waiting_seconds >= 1){
+    bar.appendChild(el("span",null,"  ·  "));
+    bar.appendChild(el("span","badge", `model ${d.model_seconds}s`));
+    bar.appendChild(el("span",null," "));
+    const w = el("span","badge warnbadge", `waiting ${d.waiting_seconds}s`);
+    w.title = "time after the model stopped streaming — report_or_respond "
+            + "awaits the background layout refresh (150s cap) before returning";
+    bar.appendChild(w);
+  }
+  if(d.path && d.path.length){
+    bar.appendChild(el("span",null,"  ·  "));
+    bar.appendChild(el("span","badge", d.path.join(" → ")));
+  }
+  if(d.edit_events){
+    bar.appendChild(el("span",null,"  "));
+    bar.appendChild(el("span","badge mag", "★ " + d.edit_events + " edit request(s)"));
+  }
+  if(d.paused){
+    bar.appendChild(el("span",null,"  "));
+    bar.appendChild(el("span","badge","paused"));
+  }
+  pane.appendChild(bar); stick(pane, was);
+  $("turnInfo").textContent = (d.handled_by||"?") + (d.elapsed!=null ? ` · ${d.elapsed}s` : "");
+  $("turnInfo").className = "pill on";
+}
+
+// ── flow: layout pane ────────────────────────────────────────────────────
+function layoutClear(){ $("layoutPane").innerHTML = ""; }
+// A card from modify_report_layout() is
+//   { section: [{name, content, tables}], sub_sections: [{name, …}], citations, summary }
+// so both `section` and `sub_sections` are lists of objects, not strings.
+const STRUCTURAL = { title:"Title", subtitle:"Subtitle", table_of_contents:"Table of contents",
+                     executive_summary:"Executive summary", conclusion:"Conclusion",
+                     references:"References", appendix:"Appendix" };
+function nameOf(entry){
+  if(entry == null) return "";
+  if(typeof entry === "string") return entry;
+  return entry.name || entry.title || entry.section || "";
+}
+function cardNames(v){
+  if(v == null) return [];
+  if(!Array.isArray(v)) v = [v];
+  return v.map(nameOf).map(s => String(s).trim()).filter(Boolean);
+}
+function cardsNode(cards){
+  const wrap = el("div");
+  (cards||[]).forEach(c => {
+    const heads = cardNames(c.section);
+    const raw = heads[0] || "";
+    const structural = Object.prototype.hasOwnProperty.call(STRUCTURAL, raw);
+    const box = el("div","lcard" + (structural ? " structural" : ""));
+    const h = el("div","h");
+    h.appendChild(el("span", null, structural ? STRUCTURAL[raw] : (raw || "(untitled)")));
+    if(structural) h.appendChild(el("span","k", "auto"));
+    box.appendChild(h);
+    const subs = cardNames(c.sub_sections);
+    if(subs.length){
+      const ul = el("ul");
+      subs.forEach(s => ul.appendChild(el("li", null, s)));
+      box.appendChild(ul);
+    }
+    if(c.summary && String(c.summary).trim())
+      box.appendChild(el("div","csum", String(c.summary).trim()));
+    wrap.appendChild(box);
+  });
+  if(!(cards||[]).length) wrap.appendChild(el("div","empty","(no cards in this layout)"));
+  return wrap;
+}
+// The routed refine requests, queued in order. Each shows the user's words, the
+// section/subsection the router picked, and the exact fe_json_for_refine the
+// refiner would consume.
+let refineQueue = [];
+function refineHost(){
+  const pane = $("layoutPane");
+  if(pane.querySelector(".empty")) pane.innerHTML = "";
+  let host = pane.querySelector("#refineHost");
+  if(!host){ host = el("div"); host.id = "refineHost"; pane.insertBefore(host, pane.firstChild); }
+  return host;
+}
+function renderRefineQueue(){
+  const host = refineHost();
+  host.innerHTML = "";
+  if(!refineQueue.length) return;
+  host.appendChild(el("div","summary", `refine queue · ${refineQueue.length} request(s)`));
+  refineQueue.forEach((e, i) => {
+    const box = el("div","rq" + (e.pending ? " pending" : ""));
+    const h = el("div","h");
+    h.appendChild(el("span","n", "#" + (i+1)));
+    h.appendChild(el("span",null, e.pending ? "routing…" : (e.target_kind || "routed")));
+    h.appendChild(el("span","t", e.at || ""));
+    box.appendChild(h);
+    box.appendChild(el("div","req", e.request || ""));
+    if(!e.pending){
+      const conf = (typeof e.confidence === "number")
+        ? "  ·  confidence " + e.confidence.toFixed(2) : "";
+      if(e.matched_name)
+        box.appendChild(el("div","tgt", `→ ${e.target_kind || "?"}: ${e.matched_name}${conf}`));
+      if(e.reasoning) box.appendChild(el("div","tgt", e.reasoning));
+      box.appendChild(el("pre", null, JSON.stringify(e.fe_json_for_refine, null, 2)));
+    }
+    host.appendChild(box);
+  });
+}
+
+function showLayoutProposal(d){
+  const pane = $("layoutPane");
+  if(pane.querySelector(".empty")) pane.innerHTML = "";
+  let host = pane.querySelector("#proposalHost");
+  if(!host){ host = el("div"); host.id = "proposalHost"; pane.insertBefore(host, pane.firstChild); }
+  host.innerHTML = "";
+  host.appendChild(el("div","summary", (d.updated ? "web-updated · " : "proposed · ") + (d.title||"")));
+  if(d.change_summary) host.appendChild(el("div","summary", d.change_summary));
+  host.appendChild(cardsNode(d.cards));
+}
+function showLayoutOption(d){
+  layoutTiers[d.report_tier] = d;
+  const pane = $("layoutPane");
+  if(pane.querySelector(".empty")) pane.innerHTML = "";
+  let host = pane.querySelector("#tierHost");
+  if(!host){ host = el("div"); host.id="tierHost"; pane.appendChild(host); }
+  if(!activeTier) activeTier = d.report_tier;
+  renderTiers(host);
+}
+function renderTiers(host){
+  host.innerHTML = "";
+  const bar = el("div","tier");
+  Object.keys(layoutTiers).forEach(t => {
+    const b = el("button","sm" + (t===activeTier ? " sel" : ""), t);
+    b.onclick = () => { activeTier = t; renderTiers(host); };
+    bar.appendChild(b);
+  });
+  host.appendChild(bar);
+  const d = layoutTiers[activeTier];
+  if(d){
+    host.appendChild(el("div","summary", `${activeTier} · ${d.title||""}`));
+    host.appendChild(cardsNode(d.cards));
+    if(d.markdown){ const p = el("pre","md", d.markdown); host.appendChild(p); }
+  }
+}
+function showFinalLayout(d){
+  const pane = $("layoutPane");
+  if(pane.querySelector(".empty")) pane.innerHTML = "";
+  pane.appendChild(el("div","summary", `final layout passed to retrieve · ${d.report_type||""}`));
+  pane.appendChild(el("pre","md", d.markdown||""));
+  pane.scrollTop = pane.scrollHeight;
+}
+function showReportProgress(d){
+  const pane = $("layoutPane");
+  if(pane.querySelector(".empty")) pane.innerHTML = "";
+  let host = pane.querySelector("#repHost");
+  if(!host){
+    host = el("div"); host.id = "repHost";
+    host.appendChild(el("div","summary","report generation"));
+    pane.appendChild(host);
+  }
+  const data = d.data || {};
+  if(data.md_content){
+    host.appendChild(el("pre","md", data.md_content));
+  } else {
+    const row = el("div","rep-step");
+    row.appendChild(el("span","s", d.status || "(step)"));
+    const bits = Object.keys(data)
+      .filter(k => !["name","status","md_content"].includes(k))
+      .map(k => `${k}=${JSON.stringify(data[k]).slice(0,90)}`);
+    row.appendChild(el("span",null, bits.join("  ") || ""));
+    host.appendChild(row);
+  }
+  const was = atBottom(pane); stick(pane, was);
+}
+
+// ── flow: events pane ────────────────────────────────────────────────────
+function renderFilters(){
+  const f = $("filters"); f.innerHTML = "";
+  EVT_MODES.forEach(m => {
+    const b = el("button", evtFilter[m] ? "" : "off", m);
+    b.onclick = () => { evtFilter[m] = !evtFilter[m]; renderFilters();
+      document.querySelectorAll(`.evt[data-mode="${m}"]`)
+        .forEach(n => n.style.display = evtFilter[m] ? "" : "none"); };
+    f.appendChild(b);
+  });
+}
+function clearEvents(){ $("events").innerHTML = ""; }
+const HOT = ["post_report_edit_request","ask_user","report_config","layout_pair",
+             "propose_report_layout","updated_proposed_report_layout","retrieve"];
+function addEvent(m, name, status, payload, isErr){
+  const pane = $("events");
+  if(pane.querySelector(".empty")) pane.innerHTML = "";
+  const was = atBottom(pane);
+  const hot = HOT.includes(name);
+  const box = el("div","evt" + (hot ? " hot" : "") + (isErr ? " err" : ""));
+  box.dataset.mode = m;
+  if(!evtFilter[m]) box.style.display = "none";
+  const h = el("div","eh");
+  h.appendChild(el("span","mode", m));
+  h.appendChild(el("span","nm", name || "—"));
+  if(status) h.appendChild(el("span","st", status));
+  h.appendChild(el("span","ts", now()));
+  const pre = el("pre", null, JSON.stringify(payload, null, 2));
+  pre.style.display = hot || isErr ? "" : "none";
+  h.onclick = () => { pre.style.display = pre.style.display === "none" ? "" : "none"; };
+  box.appendChild(h); box.appendChild(pre); pane.appendChild(box);
+  while(pane.children.length > 600) pane.removeChild(pane.firstChild);
+  stick(pane, was);
+}
+
+// ── node mode: catalog ───────────────────────────────────────────────────
+function renderCatalog(){
+  const q = ($("tgtSearch").value || "").toLowerCase().trim();
+  const pane = $("catalog"); pane.innerHTML = "";
+  const shown = catalog.filter(t => !q ||
+    t.name.toLowerCase().includes(q) || t.file.toLowerCase().includes(q) ||
+    t.kind.includes(q) || (t.doc||"").toLowerCase().includes(q));
+  $("tgtCount").textContent = shown.length + " / " + catalog.length;
+  const files = [...new Set(shown.map(t => t.file))];
+  files.forEach(f => {
+    const g = el("div","grp");
+    g.appendChild(el("div","gh", f + ".py"));
+    shown.filter(t => t.file === f).forEach(t => {
+      const row = el("div","tgt" + (selected && selected.name===t.name ? " sel" : ""));
+      row.appendChild(el("span","k " + t.kind, t.kind));
+      row.appendChild(el("span","nm", t.name));
+      if(t.heavy) row.appendChild(el("span","k", "slow"));
+      if(t.needs_graph) row.appendChild(el("span","k", "graph"));
+      row.onclick = () => selectTarget(t);
+      g.appendChild(row);
+    });
+    pane.appendChild(g);
+  });
+  if(!shown.length) pane.appendChild(el("div","empty","No target matches that filter."));
+}
+function fillTemplate(args){
+  const walk = (v) => {
+    if(v === "$MESSAGES") return JSON.parse(JSON.stringify(DEFAULT_MESSAGES));
+    if(v === "$MESSAGE_DICTS") return ["$MESSAGE_DICTS", ...JSON.parse(JSON.stringify(DEFAULT_MESSAGES))];
+    if(Array.isArray(v)) return v.map(walk);
+    if(v && typeof v === "object"){ const o={}; for(const k in v) o[k]=walk(v[k]); return o; }
+    return v;
+  };
+  return walk(args || {});
+}
+function selectTarget(t){
+  selected = t;
+  renderCatalog();
+  $("selKind").textContent = t.kind + " · " + t.file + ".py";
+  $("selKind").className = "pill on";
+  $("runBtn").disabled = busy || !!t.needs_graph;
+
+  const pane = $("inputPane"); pane.innerHTML = "";
+  if(t.needs_graph){
+    pane.appendChild(el("div","warnbar",
+      "⚠ " + t.name + " calls interrupt() — it only works inside a live graph run. Use flow mode."));
+  } else if(t.heavy){
+    pane.appendChild(el("div","warnbar",
+      "⚠ real report generation — minutes of work and real LLM spend."));
+  }
+  const sig = el("div","sigbox");
+  sig.appendChild(el("code", null, t.signature));
+  if(t.note) sig.appendChild(el("div","doc","▸ " + t.note));
+  if(t.doc) sig.appendChild(el("div","doc", t.doc));
+  pane.appendChild(sig);
+
+  const hint = el("div","hintrow");
+  hint.appendChild(el("span",null,"inputs (JSON)"));
+  const bH = el("button","sm","use live chat history");
+  bH.onclick = () => {
+    try {
+      const o = JSON.parse($("argsEditor").value);
+      if(o.state) o.state.messages = "$HISTORY";
+      else if("messages" in o) o.messages = "$HISTORY";
+      $("argsEditor").value = JSON.stringify(o, null, 2);
+    } catch(e){ alert("inputs are not valid JSON"); }
+  };
+  hint.appendChild(bH);
+  pane.appendChild(hint);
+
+  const wrap = el("div","argwrap");
+  const ta = el("textarea"); ta.id = "argsEditor"; ta.spellcheck = false;
+  ta.value = JSON.stringify(fillTemplate(t.args), null, 2);
+  wrap.appendChild(ta); pane.appendChild(wrap);
+}
+function resetArgs(){ if(selected) selectTarget(selected); }
+function runNode(){
+  if(!selected) return;
+  let args;
+  try { args = JSON.parse($("argsEditor").value); }
+  catch(e){ alert("inputs are not valid JSON:\n" + e.message); return; }
+  $("nodeOut").innerHTML = "";
+  traceReset("running " + selected.name);
+  send({ type:"run_node", name:selected.name, args,
+         use_system: $("useSystem").checked });
+}
+function outAdd(node){ const p = $("nodeOut");
+  if(p.querySelector(".empty")) p.innerHTML = "";
+  p.appendChild(node); p.scrollTop = p.scrollHeight; }
+
+// ── inbound message router ───────────────────────────────────────────────
+function handle(m){
+  switch(m.type){
+    case "status":  setConn(true, m.text); break;
+    case "ready":
+      setConn(true, "live");
+      if(reconnected){
+        reconnected = false;
+        addSessionBreak();
+      }
+      catalog = m.catalog || [];
+      renderCatalog();
+      $("pillCore").textContent = (m.caspr_core||"").split("/").pop();
+      $("pillCore").title = m.caspr_core || "";
+      break;
+    case "catalog": catalog = m.catalog || []; renderCatalog(); break;
+
+    case "state": {
+      const wasBusy = busy;
+      busy = !!m.busy;
+      if(busy && !wasBusy) startBusyClock();
+      if(!busy) stopBusyClock();
+      $("dot").className = "dot " + (busy ? "busy" : "live");
+      renderBusyText();
+      $("sendBtn").textContent = busy ? "queue" : "send";
+      $("runBtn").disabled = busy || !selected || !!(selected && selected.needs_graph);
+      reportRunning = !!m.report_running;
+      const rp = $("pillReportRun");
+      rp.style.display = reportRunning ? "" : "none";
+      rp.className = "pill " + (reportRunning ? "warn" : "off");
+      if(typeof m.refine_queued === "number"){
+        $("refinePill").textContent = "refine " + m.refine_queued;
+        $("refinePill").className = "pill " + (m.refine_queued ? "on" : "off");
+      }
+      $("histPill").textContent = "history " + (m.history_messages ?? 0);
+      $("histPill").className = "pill " + (m.history_messages ? "on" : "off");
+      syncAskBusy();
+      flushQueued();
+      $("pillReport").textContent = m.report_in_progress
+        ? "report ON · " + (m.report_title || "") : "report OFF";
+      $("pillReport").className = "pill " + (m.report_in_progress ? "on" : "off");
+      $("pillDocs").textContent = m.has_documents
+        ? "docs · " + (m.file_search_mode||"") : "no docs";
+      $("pillDocs").className = "pill " + (m.has_documents ? "on" : "off");
+      break;
+    }
+
+    // ---- flow ----
+    case "turn_start": traceReset(); curAssistant = null; break;
+    case "chat": addMsg(m.role === "user" ? "user" : "assistant", m.text,
+                        m.role === "user" ? "you" : (m.node || "caspr")); break;
+    case "assistant_start": curAssistant = addMsg("assistant","", m.node); break;
+    case "assistant_token": {
+      if(!curAssistant) curAssistant = addMsg("assistant","", m.node);
+      // Measure BEFORE appending — afterwards we are by definition no longer
+      // "at the bottom", so checking then would stop following the stream.
+      const pane = $("chat"), was = atBottom(pane);
+      curAssistant.querySelector(".body").textContent += m.text;
+      stick(pane, was);
+      break;
+    }
+    case "node_active": traceActive(m.node, m.elapsed); break;
+    case "node": tracePush(m.node, m.elapsed); break;
+    case "turn_end": traceFinish(); addTurnBar(m); curAssistant = null; break;
+    case "ask_user": addAskUser(m.questions || []); break;
+    case "report_config_required": addReportConfig(m); break;
+    case "layout_proposal": showLayoutProposal(m); break;
+    case "layout_option": showLayoutOption(m); break;
+    case "final_layout": showFinalLayout(m); break;
+    case "report_progress": showReportProgress(m); break;
+    case "refine_routing":
+      refineQueue.push({ request:m.request, pending:true, at:now() });
+      renderRefineQueue(); break;
+    case "refine_request": {
+      // replace the pending placeholder for this request, else append
+      const i = refineQueue.findIndex(x => x.pending);
+      if(i >= 0) refineQueue[i] = m.entry; else refineQueue.push(m.entry);
+      renderRefineQueue();
+      $("refinePill").textContent = "refine " + (m.queue_len ?? refineQueue.length);
+      $("refinePill").className = "pill on";
+      break;
+    }
+    case "refine_queue":
+      refineQueue = (m.queue || []).slice(); renderRefineQueue(); break;
+    case "refine_error": {
+      const i = refineQueue.findIndex(x => x.pending);
+      if(i >= 0) refineQueue.splice(i, 1);
+      renderRefineQueue();
+      addEvent("custom", "refine routing error", "", m, true);
+      break;
+    }
+    case "edit_request":
+      addMsg("assistant", "★ post_report_edit_request\n" +
+        JSON.stringify(m.data, null, 2), "edit request"); break;
+    case "layout_refresh": {
+      refreshStatus = m.status;
+      const p = $("refreshState");
+      const label = { running:"↻ refreshing…", done:"✓ web-updated", no_change:"no change",
+                      timeout:"timed out", error:"refresh error", superseded:"superseded" };
+      p.textContent = label[m.status] || m.status;
+      p.className = "pill " + (m.status === "done" ? "on" : m.status === "running" ? "" : "off");
+      renderBusyText();
+      break;
+    }
+    case "raw": {
+      const d = m.data || {};
+      const nm = m.mode === "custom" ? (d.name || "custom")
+               : m.mode === "updates" ? (d.node || "updates")
+               : m.mode === "messages" ? (d.node || "messages") : "values";
+      addEvent(m.mode, nm, d.status || "", d, false);
+      break;
+    }
+    case "event": break;   // already rendered via `raw`
+    case "scenario_ready": addMsg("assistant",
+      "Scenario loaded: report_in_progress ON with the sample EV layout.\n" +
+      "Try: \"add a paragraph on charging infrastructure to the Risks section\"", "harness"); break;
+    case "reset_done":
+      pendingSend = null; renderQueued(); refreshStatus = ""; refineQueue = [];
+      $("chat").innerHTML = ""; layoutClear(); layoutTiers = {}; activeTier = null;
+      $("layoutPane").innerHTML = '<div class="empty">No layout proposed yet.</div>';
+      traceIdle(); $("turnInfo").textContent = "no turn yet";
+      $("turnInfo").className = "pill off"; break;
+
+    // ---- node mode ----
+    case "node_start": {
+      const b = el("div","sigbox");
+      b.appendChild(el("code", null, `▶ ${m.name}  (${m.kind} · ${m.file}.py)`));
+      b.appendChild(el("pre","md", JSON.stringify(m.args, null, 2)));
+      outAdd(b); break;
+    }
+    case "node_event": {
+      const d = m.data || {};
+      addEvent("custom", d.name || "custom", d.status || "", d, false);
+      const row = el("div","rep-step");
+      row.appendChild(el("span","s", (d.name||"event") + (d.status ? "·"+d.status : "")));
+      row.appendChild(el("span",null, JSON.stringify(d).slice(0,400)));
+      outAdd(row); break;
+    }
+    case "node_error": {
+      const b = el("div","sigbox");
+      b.appendChild(el("div","res-bad", "✗ " + m.message));
+      if(m.trace) b.appendChild(el("pre","md", m.trace));
+      outAdd(b); traceFinish(); break;
+    }
+    case "node_result": {
+      traceFinish();
+      $("runTime").textContent = m.elapsed + "s";
+      $("runTime").className = "pill " + (m.ok ? "on" : "off");
+      const b = el("div","sigbox");
+      if(m.ok){
+        b.appendChild(el("div","res-ok", `✓ returned ${m.result_type} in ${m.elapsed}s`));
+        b.appendChild(el("pre","md", JSON.stringify(m.result, null, 2)));
+      } else {
+        b.appendChild(el("div","res-bad", `✗ raised ${m.error} after ${m.elapsed}s`));
+        b.appendChild(el("pre","md", m.trace || ""));
+      }
+      const n = (m.events || []).length;
+      b.appendChild(el("div","doc", `${n} stream event${n===1?"":"s"} emitted`));
+      outAdd(b); break;
+    }
+
+    case "error": {
+      addEvent("custom", "harness error", "", { message:m.message, trace:m.trace }, true);
+      if(mode === "node") {
+        const b = el("div","sigbox");
+        b.appendChild(el("div","res-bad", "✗ " + m.message));
+        if(m.trace) b.appendChild(el("pre","md", m.trace));
+        outAdd(b);
+      } else {
+        addMsg("assistant", "✗ " + m.message, "harness error");
+      }
+      traceFinish();
+      break;
+    }
+    case "report_done":
+      addMsg("assistant", "✓ report generation finished.", "harness"); break;
+    case "history": {
+      const msgs = m.messages || [];
+      addEvent("values", "history replayed to the model", msgs.length + " messages",
+               msgs.map((x, i) => ({ i, type:x.type, name:x.name,
+                                     tool_calls:x.tool_calls,
+                                     content:(x.content||"").slice(0,160) })), false);
+      break;
+    }
+    default: console.debug("unhandled", m);
+  }
+}
+
+// ── actions ──────────────────────────────────────────────────────────────
+// A turn can still be draining when its ask_user options are already on screen
+// (report_or_respond awaits the background layout refresh before the turn ends),
+// so an answer clicked in that window must be queued, not dropped.
+let pendingSend = null;
+function sendTurn(text){
+  const t = String(text !== undefined ? text : $("input").value).trim();
+  if(!t) return;
+  $("input").value = "";
+  if(busy){ pendingSend = t; renderQueued(); return; }
+  send({ type:"send", text:t });
+}
+function renderQueued(){
+  const bar = $("queued");
+  if(!pendingSend){ bar.style.display = "none"; bar.innerHTML = ""; return; }
+  bar.style.display = "flex";
+  bar.innerHTML = "";
+  bar.appendChild(el("span",null,"queued — sends when this turn finishes:"));
+  bar.appendChild(el("span","qtext", pendingSend));
+  const x = el("button","sm","cancel");
+  x.onclick = () => { pendingSend = null; renderQueued(); };
+  bar.appendChild(x);
+}
+function flushQueued(){
+  if(busy || !pendingSend) return;
+  const t = pendingSend; pendingSend = null; renderQueued();
+  send({ type:"send", text:t });
+}
+let reportOn = false;
+function toggleReport(){
+  reportOn = !reportOn;
+  send(reportOn ? { type:"report_on", title:"EV Market Outlook 2026" } : { type:"report_off" });
+}
+function resetAll(){
+  clearEvents(); send({ type:"reset" });
+}
+$("input").addEventListener("keydown", (e) => {
+  if(e.key === "Enter" && !e.shiftKey){ e.preventDefault(); sendTurn(); }
+});
+document.addEventListener("keydown", (e) => {
+  if(e.key === "Enter" && (e.metaKey || e.ctrlKey) && mode === "node"){ e.preventDefault(); runNode(); }
+});
+
+renderFilters();
+connect();
+</script>
+</body>
+</html>
