@@ -121,6 +121,8 @@
             letter-spacing:1px; }
   .cfg .row { display:flex; gap:8px; align-items:center; margin-bottom:6px; }
   .cfg label { color:var(--dim); font-size:11px; min-width:52px; }
+  .cfg .gate-hint { color:var(--dim); font-size:11px; margin-top:7px; }
+  .cfg .gate-note { color:var(--yellow); font-size:11px; margin-top:5px; }
 
   /* ── layout cards ───────────────────────────────────────── */
   .lcard { border:1px solid var(--border); border-radius:6px; margin-bottom:8px;
@@ -132,6 +134,11 @@
   .lcard li { padding:1px 0; }
   .lcard.structural { opacity:.62; }
   .lcard.structural .h { font-weight:400; }
+  /* still streaming in — not yet the layout the tool parsed */
+  .lcard.live { border-style:dashed; border-color:var(--accent); }
+  /* A card the web refresh just swapped in, over the proposal's own. */
+  .lcard.web { border-style:solid; border-color:#2e9d5b; box-shadow:0 0 0 1px #2e9d5b33; }
+  .summary.live { border-left-color:var(--accent); color:var(--accent); }
   .lcard .csum { padding:5px 9px; color:var(--dim); border-top:1px dotted var(--border); }
   .rq { border:1px solid var(--magenta); border-radius:6px; margin-bottom:8px;
         background:var(--panel); overflow:hidden; }
@@ -226,6 +233,7 @@
   <span class="pill off" id="pillReportRun" style="display:none">⚙ report generating…</span>
   <span class="spacer"></span>
   <span class="pill off" id="pillCore" title=""></span>
+  <span class="pill off" id="pillMemory" title="">memory …</span>
   <button class="sm" onclick="send({type:'scenario'})">load scenario</button>
   <button class="sm" onclick="toggleReport()">toggle report flag</button>
   <button class="sm danger" onclick="resetAll()">reset</button>
@@ -319,6 +327,12 @@ let everConnected = false, reconnected = false;
 // intended behaviour, not something to queue.
 let reportRunning = false;
 let curAssistant = null, curTurnPath = [], layoutTiers = {}, activeTier = null;
+// The configuration gate stays open while the user keeps talking, so the page
+// has to know it is up: a tier toggle then means "this is what I am looking at".
+let gateOpen = false;
+// The proposal whose cards are currently streaming in, so a revised one
+// starts a fresh preview instead of appending to the previous layout.
+let streamedProposal = null;   // { id, cards, first } while a preview streams
 const EVT_MODES = ["messages","updates","custom","values"];
 const evtFilter = { messages:false, updates:true, custom:true, values:false };
 const DEFAULT_MESSAGES = [
@@ -481,14 +495,30 @@ function syncAskBusy(){
 }
 function addReportConfig(p){
   chatClearEmpty();
+  gateOpen = true;
   const pane = $("chat"), was = atBottom(pane);
   const box = el("div","cfg");
-  box.appendChild(el("h3","","report configuration required"));
+  box.id = "gateBox";
+  const head = el("h3","","report configuration");
+  box.appendChild(head);
   const tiers = p.tiers && p.tiers.length ? p.tiers : ["study","brief"];
   const styles = p.styles && p.styles.length ? p.styles : ["investor"];
+  const shown = p.selected_tier || p.default_tier || tiers[0];
   const r1 = el("div","row"); r1.appendChild(el("label",null,"tier"));
-  const selT = el("select"); tiers.forEach(t => { const o=el("option",null,t); o.value=t;
-    if(t===p.default_tier) o.selected=true; selT.appendChild(o); }); r1.appendChild(selT);
+  const selT = el("select"); selT.id = "gateTier";
+  tiers.forEach(t => { const o=el("option",null,t); o.value=t; selT.appendChild(o); });
+  // Set the value after the options are in the select: selecting one while they
+  // are still detached loses to the browser picking the first.
+  selT.value = shown;
+  r1.appendChild(selT);
+  // Switching here is what the model is told it is looking at, so the backend
+  // has to hear about it before the next message.
+  selT.onchange = () => selectGateTier(selT.value);
+  // And say it once on open, so the panel and the model cannot start out
+  // disagreeing about which layout is on screen.
+  selectGateTier(shown);
+  if(layoutTiers[shown]){ activeTier = shown; const h = $("layoutPane").querySelector("#tierHost");
+    if(h) renderTiers(h); }
   const r2 = el("div","row"); r2.appendChild(el("label",null,"style"));
   const selS = el("select"); styles.forEach(s => { const o=el("option",null,s); o.value=s; selS.appendChild(o); });
   r2.appendChild(selS);
@@ -496,13 +526,41 @@ function addReportConfig(p){
   const inL = el("input"); inL.type="text"; inL.value="English"; r3.appendChild(inL);
   const btn = el("button","primary","confirm");
   btn.onclick = () => {
+    gateOpen = false;
     btn.disabled = true; selT.disabled = selS.disabled = inL.disabled = true;
     send({ type:"confirm_report_config", report_tier:selT.value,
            style:selS.value, language:inL.value });
   };
   box.appendChild(r1); box.appendChild(r2); box.appendChild(r3);
   box.appendChild(btn);
+  box.appendChild(el("div","gate-hint",
+    "this stays open — keep chatting to change the layout you have selected, "
+    + "then confirm to build it"));
+  // The header states the selection too: the model answers "which type is
+  // selected?" from this same value, so a mismatch has to be visible.
+  const syncHead = () => { head.textContent = `report configuration · showing ${selT.value}`; };
+  selT.addEventListener("change", syncHead);
+  syncHead();
   pane.appendChild(box); stick(pane, was);
+}
+// The panel follows the conversation: a revision replaces the tier on screen.
+function gateLayoutUpdated(m){
+  layoutTiers[m.report_tier] = {
+    report_tier: m.report_tier, title: m.title, cards: m.cards, markdown: m.markdown,
+  };
+  activeTier = m.report_tier;
+  const host = $("layoutPane").querySelector("#tierHost");
+  if(host) renderTiers(host);
+  const box = $("gateBox");
+  if(box){
+    let note = box.querySelector(".gate-note");
+    if(!note){ note = el("div","gate-note"); box.appendChild(note); }
+    note.textContent = `${m.report_tier} layout updated — confirm builds this version`;
+  }
+}
+function selectGateTier(tier){
+  if(!gateOpen) return;
+  send({ type:"select_gate_tier", report_tier:tier });
 }
 // Drawn when the socket comes back on a NEW server session, so it is obvious the
 // messages above are no longer in the model's context.
@@ -519,7 +577,7 @@ function addSessionBreak(){
   bar.appendChild(b);
   pane.appendChild(bar);
   pane.scrollTop = pane.scrollHeight;
-  layoutTiers = {}; activeTier = null;
+  layoutTiers = {}; activeTier = null; streamedProposal = null; gateOpen = false;
   $("turnInfo").textContent = "no turn yet"; $("turnInfo").className = "pill off";
   traceIdle();
 }
@@ -636,6 +694,138 @@ function renderRefineQueue(){
   });
 }
 
+// The layout streaming in while the model is still writing it. Cards land one
+// at a time into the same host `showLayoutProposal` uses, so the authoritative
+// proposal that follows simply overwrites the preview. Cards are dashed while
+// they are a preview — what is on screen is not yet the layout the tool parsed.
+function showLayoutStream(d){
+  const pane = $("layoutPane");
+  if(pane.querySelector(".empty")) pane.innerHTML = "";
+  let host = pane.querySelector("#proposalHost");
+  if(!host){ host = el("div"); host.id = "proposalHost"; pane.insertBefore(host, pane.firstChild); }
+  if(d.phase === "start"){
+    streamedProposal = { id:d.proposal_id, cards:0, first:null, title:"" };
+    host.innerHTML = "";
+    const tag = [d.report_type, d.domain_name].filter(Boolean).join(" · ");
+    const head = el("div","summary live","proposing…" + (tag ? ` (${tag})` : ""));
+    head.id = "streamHead";
+    host.appendChild(head);
+    return;
+  }
+  if(!streamedProposal || d.proposal_id !== streamedProposal.id) return;
+  const head = host.querySelector("#streamHead");
+  // caspr-core sends the title on its own, as soon as the JSON's `sections`
+  // array opens -- before the first section has closed.
+  if(d.phase === "title"){
+    streamedProposal.title = d.title || "";
+    if(head) head.textContent = `proposing… ${streamedProposal.title}` + secs(d.elapsed);
+    return;
+  }
+  if(d.phase === "card"){
+    if(streamedProposal.first === null) streamedProposal.first = d.elapsed ?? null;
+    streamedProposal.cards++;
+    const node = cardsNode([d.card]);
+    node.querySelectorAll(".lcard").forEach(c => c.classList.add("live"));
+    host.appendChild(node);
+    if(head) head.textContent = `proposing… ${streamedProposal.cards} card`
+      + (streamedProposal.cards === 1 ? "" : "s") + secs(d.elapsed);
+    return;
+  }
+  if(head){
+    // First card vs. last: the wait the preview removed, in the harness's own terms.
+    const span = streamedProposal.first !== null && d.elapsed != null
+      ? ` · first card ${streamedProposal.first}s, last ${d.elapsed}s` : "";
+    head.textContent = (d.aborted ? "proposal cut short · " : "streamed · ")
+      + (d.title || streamedProposal.title || "") + ` · ${streamedProposal.cards} cards` + span
+      + (d.message ? ` · ${d.message}` : "");
+  }
+}
+function secs(v){ return v == null ? "" : ` · ${v}s`; }
+// The web refresh streaming over the proposal on screen. Card N of the refresh
+// replaces card N of the proposal in place, so the web version takes over one
+// section at a time; the proposal is snapshotted first so an aborted refresh
+// can put it back, and cards past the refresh's final count are dropped.
+let refreshStream = null;   // { snapshot, replaced } while a refresh streams
+function showLayoutRefreshStream(d){
+  const host = $("layoutPane").querySelector("#proposalHost");
+  if(!host) return;
+  if(d.phase === "start"){
+    refreshStream = { snapshot: host.innerHTML, replaced: 0 };
+    const head = el("div","summary live","web-updating…");
+    head.id = "refreshHead";
+    host.insertBefore(head, host.firstChild);
+    return;
+  }
+  if(!refreshStream) return;
+  const head = host.querySelector("#refreshHead");
+  if(d.phase === "card"){
+    const node = cardsNode([d.card]).querySelector(".lcard");
+    if(!node) return;
+    node.classList.add("web");
+    const existing = host.querySelectorAll(".lcard");
+    if(existing[d.index]) existing[d.index].replaceWith(node);
+    else if(existing.length) existing[existing.length-1].after(node);
+    else host.appendChild(node);
+    refreshStream.replaced++;
+    if(head) head.textContent = `web-updating… ${refreshStream.replaced} card`
+      + (refreshStream.replaced === 1 ? "" : "s") + " replaced" + secs(d.elapsed);
+    return;
+  }
+  // end
+  if(d.aborted){
+    host.innerHTML = refreshStream.snapshot;
+    const note = el("div","summary","web refresh abandoned · proposal restored");
+    host.insertBefore(note, host.firstChild);
+  } else {
+    host.querySelectorAll(".lcard").forEach((c, i) => { if(i >= d.cards) c.remove(); });
+    if(head){
+      head.classList.remove("live");
+      head.textContent = `web-updated · ${d.title || ""} · ${d.cards} cards` + secs(d.elapsed);
+    }
+    if(d.change_summary) host.insertBefore(el("div","summary", d.change_summary), head ? head.nextSibling : host.firstChild);
+  }
+  refreshStream = null;
+}
+// caspr-core's `{title, description, subsections}` in the card shape `cardsNode` renders.
+function coreSectionCard(sec){
+  sec = sec || {};
+  return { section:[{name:sec.title||""}],
+           sub_sections:(sec.subsections||[]).map(n => ({name:n})),
+           summary:sec.description||"" };
+}
+// Node-mode runs get caspr-core's `propose_report_layout` events raw; flow mode
+// has the server translate them. Both end up in the same layout pane.
+let coreNodeSeq = 0;
+function showCoreLayoutEvent(d){
+  const id = "core-node-" + coreNodeSeq;
+  switch(d.status){
+    case "layout_stream_start":
+      coreNodeSeq++;
+      showLayoutStream({ phase:"start", proposal_id:"core-node-" + coreNodeSeq,
+                         report_type:d.report_type, domain_name:d.domain_name });
+      break;
+    case "layout_title":
+      showLayoutStream({ phase:"title", proposal_id:id, title:d.title }); break;
+    case "layout_section":
+      showLayoutStream({ phase:"card", proposal_id:id, index:d.index,
+                         card:coreSectionCard(d.section) }); break;
+    case "layout_stream_failed":
+      showLayoutStream({ phase:"end", proposal_id:id, aborted:true, message:d.message }); break;
+    case "layout_stream_complete": {
+      const layout = d.layout || {};
+      showLayoutProposal({ updated:false, title:layout.title||"",
+                           cards:(layout.sections||[]).map(coreSectionCard) });
+      break;
+    }
+  }
+}
+// Custom-event name → the phase `showLayoutStream` expects, for node-mode runs
+// where events arrive raw instead of pre-flattened by the server.
+const LAYOUT_STREAM_PHASE = {
+  proposed_report_layout_start: "start",
+  proposed_report_layout_card:  "card",
+  proposed_report_layout_end:   "end",
+};
 function showLayoutProposal(d){
   const pane = $("layoutPane");
   if(pane.querySelector(".empty")) pane.innerHTML = "";
@@ -660,7 +850,12 @@ function renderTiers(host){
   const bar = el("div","tier");
   Object.keys(layoutTiers).forEach(t => {
     const b = el("button","sm" + (t===activeTier ? " sel" : ""), t);
-    b.onclick = () => { activeTier = t; renderTiers(host); };
+    b.onclick = () => {
+      activeTier = t; renderTiers(host);
+      const sel = $("gateTier");
+      if(sel && sel.value !== t){ sel.value = t; }
+      selectGateTier(t);
+    };
     bar.appendChild(b);
   });
   host.appendChild(bar);
@@ -675,7 +870,11 @@ function showFinalLayout(d){
   const pane = $("layoutPane");
   if(pane.querySelector(".empty")) pane.innerHTML = "";
   pane.appendChild(el("div","summary", `final layout passed to retrieve · ${d.report_type||""}`));
-  pane.appendChild(el("pre","md", d.markdown||""));
+  // `retrieve` emits the parsed layout, which is a list of cards — not Markdown.
+  // Rendering the array as text is how this pane ended up full of [object Object].
+  const body = d.markdown;
+  if(Array.isArray(body)) pane.appendChild(cardsNode(body));
+  else pane.appendChild(el("pre","md", typeof body === "string" ? body : JSON.stringify(body||"", null, 2)));
   pane.scrollTop = pane.scrollHeight;
 }
 function showReportProgress(d){
@@ -841,6 +1040,18 @@ function handle(m){
       renderCatalog();
       $("pillCore").textContent = (m.caspr_core||"").split("/").pop();
       $("pillCore").title = m.caspr_core || "";
+      // What Casper was built with: the user memory drives chat tone and the
+      // default report audience, so a run is only comparable if you know it loaded.
+      {
+        const um = m.user_memory || {};
+        const pill = $("pillMemory");
+        pill.textContent = um.state === "loaded"
+          ? `memory: ${um.audience || "(none)"}`
+          : `memory: ${um.state || "?"}`;
+        pill.className = "pill " + (um.state === "loaded" ? "on"
+          : um.state === "off" ? "off" : "warn");
+        pill.title = um.path || "no user memory loaded";
+      }
       break;
     case "catalog": catalog = m.catalog || []; renderCatalog(); break;
 
@@ -893,6 +1104,23 @@ function handle(m){
     case "turn_end": traceFinish(); addTurnBar(m); curAssistant = null; break;
     case "ask_user": addAskUser(m.questions || []); break;
     case "report_config_required": addReportConfig(m); break;
+    case "report_config_updated": gateLayoutUpdated(m); break;
+    case "gate_context":
+      addEvent("custom", "gate_context", m.report_tier, {
+        selected_tier: m.report_tier, report_title: m.report_title,
+        layout_chars: m.layout_chars,
+      }, false);
+      break;
+    case "gate_tier": {
+      const sel = $("gateTier");
+      if(sel && sel.value !== m.report_tier){
+        sel.value = m.report_tier;
+        sel.dispatchEvent(new Event("change"));
+      }
+      break;
+    }
+    case "layout_stream": showLayoutStream(m); break;
+    case "layout_refresh_stream": showLayoutRefreshStream(m); break;
     case "layout_proposal": showLayoutProposal(m); break;
     case "layout_option": showLayoutOption(m); break;
     case "final_layout": showFinalLayout(m); break;
@@ -945,7 +1173,7 @@ function handle(m){
       "Try: \"add a paragraph on charging infrastructure to the Risks section\"", "harness"); break;
     case "reset_done":
       pendingSend = null; renderQueued(); refreshStatus = ""; refineQueue = [];
-      $("chat").innerHTML = ""; layoutClear(); layoutTiers = {}; activeTier = null;
+      $("chat").innerHTML = ""; layoutClear(); layoutTiers = {}; activeTier = null; streamedProposal = null;
       $("layoutPane").innerHTML = '<div class="empty">No layout proposed yet.</div>';
       traceIdle(); $("turnInfo").textContent = "no turn yet";
       $("turnInfo").className = "pill off"; break;
@@ -960,6 +1188,16 @@ function handle(m){
     case "node_event": {
       const d = m.data || {};
       addEvent("custom", d.name || "custom", d.status || "", d, false);
+      // A single-node run of report_or_respond streams a layout too — show it in
+      // the layout pane, not just as JSON in the output list.
+      if(LAYOUT_STREAM_PHASE[d.name])
+        showLayoutStream({ phase:LAYOUT_STREAM_PHASE[d.name], proposal_id:d.proposal_id||"",
+                           index:d.index||0, card:d.card||{}, title:d.report_title||"",
+                           aborted:!!d.aborted });
+      else if(d.name === "propose_report_layout" && d.report_layout)
+        showLayoutProposal({ updated:false, title:d.report_title||"", cards:d.report_layout });
+      else if(d.name === "propose_report_layout" && String(d.status||"").startsWith("layout_"))
+        showCoreLayoutEvent(d);
       const row = el("div","rep-step");
       row.appendChild(el("span","s", (d.name||"event") + (d.status ? "·"+d.status : "")));
       row.appendChild(el("span",null, JSON.stringify(d).slice(0,400)));

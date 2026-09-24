@@ -2,7 +2,9 @@
 """Caspr agent harness — run the whole graph, or any single node/tool on its own.
 
 Two modes over one WebSocket, against ONE live ``Casper`` built from the real
-code in ``caspr-core-old`` (``$CASPR_CORE_DIR`` to override):
+code in ``caspr-core`` (``$CASPR_CORE_DIR`` to override; pointing it at
+``caspr-core-old`` works too -- a checkout without the split agent modules
+simply drops the old-only targets from node mode):
 
   flow   drive a full turn through ``get_processing_state`` and forward every
          stream item — per-token text, ``updates`` node hops, ``values``
@@ -20,6 +22,10 @@ code in ``caspr-core-old`` (``$CASPR_CORE_DIR`` to override):
 Only the infrastructure the harness has no access to is neutralised (Postgres
 cost/analytics writers, CloudWatch); the agent code itself runs untouched.
 
+Casper is built with the user memory in ``$CASPR_USER_MEMORY`` (default: the
+checkout's ``tests/fixtures/sample_user_memory.json``), so the harness shows the
+personalised tone. ``CASPR_USER_MEMORY=off`` builds Casper with no memory.
+
 Needs a populated ``.env`` in the caspr checkout. Any interpreter works — this
 re-execs itself under that checkout's ``.venv``:
 
@@ -36,7 +42,7 @@ from pathlib import Path
 # ── locate the caspr codebase this harness runs against ────────────────────
 _HARNESS_DIR = Path(__file__).resolve().parent
 _CASPR_CORE = Path(
-    os.environ.get("CASPR_CORE_DIR", str(_HARNESS_DIR.parent / "caspr-core-old"))
+    os.environ.get("CASPR_CORE_DIR", str(_HARNESS_DIR.parent / "caspr-core"))
 ).resolve()
 _AGENT_DIR = _CASPR_CORE / "src" / "app" / "research" / "agent"
 
@@ -221,12 +227,38 @@ from langchain_core.messages import (  # noqa: E402
     ToolMessage,
 )
 
-from app.research.agent import _chat, _graph, _helpers, _report, _retrieve, _state  # noqa: E402
-from app.research.agent.refine_request_router import (  # noqa: E402
-    ROUTED_EVENT_NAME,
-    RefineRequestRouter,
-)
+try:  # a checkout without the split agent modules keeps everything in model.py
+    from app.research.agent import _chat, _graph, _helpers, _report, _retrieve, _state  # noqa: E402
+
+    SPLIT_AGENT = True
+except ImportError:
+    _chat = _graph = _helpers = _report = _retrieve = _state = None
+    SPLIT_AGENT = False
+try:  # commented out in core along with `respond_during_report`
+    from app.research.agent.refine_request_router import (  # noqa: E402
+        ROUTED_EVENT_NAME,
+        RefineRequestRouter,
+    )
+except Exception:  # pragma: no cover - depends on the checkout
+    ROUTED_EVENT_NAME = "refine_request_routed"
+    RefineRequestRouter = None
 from app.research.agent.model import Casper  # noqa: E402
+
+try:  # the API's own splice, so the harness saves what production saves
+    from app.chats.router_sessions import _with_ask_user_answer  # noqa: E402
+except Exception:  # pragma: no cover - router imports the world; harness need not
+
+    def _with_ask_user_answer(messages: list[dict], answer: str) -> list[dict]:
+        """The user's answer, after the tool result it produced."""
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if message.get("type") == "tool" and message.get("name") == "ask_user":
+                return [
+                    *messages[: index + 1],
+                    {"type": "human", "content": answer},
+                    *messages[index + 1 :],
+                ]
+        return messages
 
 _quiet_app_logging()
 
@@ -245,7 +277,9 @@ async def index() -> FileResponse:
 
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
-    return JSONResponse({"ok": True, "caspr_core": str(_CASPR_CORE)})
+    return JSONResponse(
+        {"ok": True, "caspr_core": str(_CASPR_CORE), "user_memory": load_user_memory()[1]}
+    )
 
 
 @app.on_event("startup")
@@ -374,7 +408,7 @@ def _mk_messages(specs, system: SystemMessage | None = None) -> list:
 # the name on each module is what lets a node run on its own and still be
 # observed — the same seam the unit tests use.
 def _patchable_modules():
-    mods = [_chat, _retrieve, _report, _graph]
+    mods = [m for m in (_chat, _retrieve, _report, _graph) if m is not None]
     for name, mod in list(sys.modules.items()):
         if not name.startswith("app."):
             continue
@@ -419,13 +453,10 @@ _REGISTRY: list[dict] = [
     # ---- _chat.py ----
     {"file": "_chat", "kind": "node", "name": "report_or_respond", "args": _STATE_ARG,
      "note": "Main planner. Real LLM call; may emit tool calls."},
-    {"file": "_chat", "kind": "node", "name": "respond_during_report", "args": _STATE_ARG,
-     "note": "Chat-only node used while a report is generating."},
-    {"file": "_chat", "kind": "router", "name": "_route_entry", "args": _STATE_ARG},
     {"file": "_chat", "kind": "tool", "name": "ask_user",
-     "args": {"questions": ["Primary Research", "Due Diligence", "Standard Report"]}},
-    {"file": "_chat", "kind": "helper", "name": "_extract_in_progress_layout",
-     "args": {"messages": "$MESSAGES"}},
+     "args": {"questions": ["Primary Research", "Due Diligence", "Standard Report"]},
+     "needs_graph": True,
+     "note": "Calls interrupt() — stops the run until the user answers. Use flow mode."},
     {"file": "_chat", "kind": "helper", "name": "generate_chat_title",
      "args": {"user_query": "Give me a report on the UK fintech market",
               "ai_response": "Here is a proposed layout for that report."}},
@@ -456,10 +487,13 @@ _REGISTRY: list[dict] = [
 
     # ---- _report.py ----
     {"file": "_report", "kind": "tool", "name": "propose_report_layout",
-     "args": {"report_layout": "# UK Fintech\n\n## Market Size\n- Segments\n- Growth\n\n"
-                               "## Regulation\n- FCA\n",
-              "report_title": "UK Fintech"},
-     "note": "Kicks off the background web refresh as a side effect."},
+     "args": {"topic": "Study on the UK fintech market",
+              "report_type": "study",
+              "context": "Audience: investors. Focus 2024-2026, payments and lending.",
+              "domain_name": "market_insight",
+              "revision_request": "", "previous_layout": "", "report_title": ""},
+     "note": "Its own structured LLM call, streamed: a card per section as the JSON "
+             "closes. Kicks off the background web refresh as a side effect."},
     {"file": "_report", "kind": "tool", "name": "update_proposed_report_layout",
      "args": {"report_layout": "# UK Fintech\n\n## Market Size\n\n## Regulation\n",
               "report_title": "UK Fintech"},
@@ -475,8 +509,8 @@ _REGISTRY: list[dict] = [
     {"file": "_report", "kind": "node", "name": "layout_pair", "args": _STATE_ARG,
      "note": "Mints both tiers' layouts. Two real LLM passes."},
     {"file": "_report", "kind": "node", "name": "report_config", "args": _STATE_ARG,
-     "needs_graph": True,
-     "note": "Calls interrupt() — only works inside a graph run. Use flow mode."},
+     "note": "Asks for the configuration and ends the turn. Parks the retrieve "
+             "args; the Confirm replays them through run_confirmed_report."},
     {"file": "_report", "kind": "node", "name": "generate_report", "args": _STATE_ARG,
      "heavy": True,
      "note": "The real report build. Minutes, and real LLM spend per card."},
@@ -497,6 +531,8 @@ _REGISTRY: list[dict] = [
     {"file": "_graph", "kind": "router", "name": "_route_after_report_or_respond",
      "args": _STATE_ARG},
     {"file": "_graph", "kind": "router", "name": "_route_after_gate", "args": _STATE_ARG},
+    {"file": "_graph", "kind": "router", "name": "_route_entry", "args": _STATE_ARG},
+    {"file": "_graph", "kind": "helper", "name": "pending_ask_user_snapshot", "args": {}},
     {"file": "_graph", "kind": "router", "name": "_route_by_domain", "args": _STATE_ARG},
     {"file": "_graph", "kind": "node", "name": "domain_router", "args": _STATE_ARG},
     {"file": "_graph", "kind": "helper", "name": "_count_turn_tool_calls",
@@ -525,6 +561,38 @@ _REGISTRY: list[dict] = [
     {"file": "_helpers", "kind": "func", "name": "_heartbeat_messages",
      "args": {"search_query": "UK fintech", "progress_updates": []}},
 ]
+
+# caspr-core: one `model.py`, and `propose_report_layout` takes the agent's
+# context and streams a structured layout section by section.
+_REGISTRY_CORE: list[dict] = [
+    {"file": "model", "kind": "node", "name": "report_or_respond", "args": _STATE_ARG,
+     "note": "Main planner. Real LLM call; may emit tool calls."},
+    {"file": "model", "kind": "tool", "name": "propose_report_layout",
+     "args": {"topic": "Brief on the UK fintech market",
+              "report_type": "brief",
+              "context": "Audience: investors. Focus 2024-2026, payments and lending.",
+              "domain_name": "market_insight",
+              "revision_request": "", "previous_layout": "",
+              "status_message": "Drafting a layout for your fintech brief"},
+     "note": "One structured-output LLM call. Streams title, then each whole section."},
+    {"file": "model", "kind": "tool", "name": "query_document",
+     "args": {"user_query": "What does the document say about revenue?",
+              "status_message": "Reading your document", "progress_updates": []},
+     "note": "Needs an uploaded-document session; returns a notice otherwise."},
+    {"file": "model", "kind": "tool", "name": "retrieve_latest_info",
+     "args": {"user_query": "latest UK fintech funding rounds",
+              "status_message": "Checking current sources", "progress_updates": []},
+     "note": "Not bound in the graph, still callable directly."},
+    {"file": "model", "kind": "node", "name": "_sequential_tools_node", "args": _STATE_ARG},
+    {"file": "model", "kind": "node", "name": "_gate_node", "args": _STATE_ARG},
+    {"file": "model", "kind": "router", "name": "_route_after_report_or_respond",
+     "args": _STATE_ARG},
+    {"file": "model", "kind": "router", "name": "_route_after_gate", "args": _STATE_ARG},
+    {"file": "model", "kind": "node", "name": "generate_report", "args": _STATE_ARG,
+     "heavy": True, "note": "The real report build. Minutes, and real LLM spend per card."},
+]
+if not SPLIT_AGENT:
+    _REGISTRY = _REGISTRY_CORE
 
 _MODULES = {"_chat": _chat, "_retrieve": _retrieve, "_report": _report,
             "_graph": _graph, "_helpers": _helpers, "_state": _state}
@@ -562,6 +630,15 @@ def build_catalog(casper) -> list[dict]:
     return out
 
 
+def _core_section_card(section: dict) -> dict:
+    """caspr-core's `{title, description, subsections}` in the page's card shape."""
+    return {
+        "section": [{"name": section.get("title", "")}],
+        "sub_sections": [{"name": s} for s in section.get("subsections") or []],
+        "summary": section.get("description", ""),
+    }
+
+
 # ── the harness session ────────────────────────────────────────────────────
 class HarnessSession:
     def __init__(self, casper, send):
@@ -571,10 +648,17 @@ class HarnessSession:
         self.layout_text: str = ""
         self._layout_watch: asyncio.Task | None = None
         self._emitted_updated_id: int | None = None
-        # The graph parks here until a Confirm. A later chat message does not
-        # resume it — only confirm_report_config does.
+        # What the configuration request parked: the retrieve args, both
+        # layouts, and the line the model had already written. The Confirm
+        # replays them — nothing is resumed, the turn that asked for them ended.
         self.paused_thread_id: str | None = None
         self.paused_payload: dict | None = None
+        # Which of the two layouts the gate is showing. It opens on the tier the
+        # conversation settled on, and the page moves it when the user toggles.
+        self.gate_tier: str | None = None
+        # `ask_user` is the one thing that does park a run: it holds the thread
+        # open on an interrupt, and the next chat message is the answer.
+        self.awaiting_answer_thread: str | None = None
         # `busy` gates FOREGROUND chat turns only. A report generating in the
         # background must not block chat — that is the whole point of
         # `respond_during_report`.
@@ -591,6 +675,8 @@ class HarnessSession:
 
     # -- state ----------------------------------------------------------
     def set_report_in_progress(self, on: bool, title: str | None = None):
+        # `respond_during_report` is commented out in core, so this no longer
+        # routes a follow-up anywhere. It still drives the page's own state.
         self.casper.report_in_progress = on
         self.casper.in_progress_report_id = "harness-report-1" if on else None
         if title:
@@ -617,6 +703,8 @@ class HarnessSession:
             "history_messages": len(self.history),
             "paused": bool(self.paused_thread_id),
             "paused_thread_id": self.paused_thread_id,
+            "awaiting_answer": bool(self.awaiting_answer_thread),
+            "gate_tier": self.gate_tier,
             "thread_id": getattr(c, "turn_thread_id", None),
             "has_documents": bool(self._safe_call(c._has_uploaded_documents)),
             "file_search_mode": getattr(c, "file_search_mode", None),
@@ -636,7 +724,7 @@ class HarnessSession:
     async def emit(self, **payload):
         await self._send(payload)
 
-    def _remember(self, final_messages) -> None:
+    def _remember(self, final_messages, answer: str | None = None) -> None:
         """Write the turn back into history without dropping earlier humans.
 
         A short ``values`` snapshot must not replace a longer conversation the
@@ -650,7 +738,13 @@ class HarnessSession:
                 if getattr(m, "type", None) != "system"
                 and not (isinstance(m, dict) and m.get("type") == "system")
             ]
-            dumped = _helpers._keep_finished_chat_history(dumped)
+            if _helpers is not None:
+                dumped = _helpers._keep_finished_chat_history(dumped)
+            if answer is not None:
+                # An `ask_user` answer went into the run as a tool result, not as
+                # a message, so the transcript would show the question and the
+                # reply with nothing from the user in between.
+                dumped = _with_ask_user_answer(dumped, answer)
         if len(dumped) >= len(self.history):
             self.history = dumped
 
@@ -662,20 +756,35 @@ class HarnessSession:
         checkpointed history and the messages reducer would duplicate.
         """
         self.casper.turn_thread_id = str(uuid7())
-        self.casper._resuming_report_config = False
+        self.casper._resuming_ask_user = False
         self.casper.report_config_submission = {}
 
     # -- flow mode ------------------------------------------------------
     async def send_turn(self, text: str):
+        # A question is open: this message finishes the run that asked it rather
+        # than starting a new one, exactly as the API treats it.
+        if self.awaiting_answer_thread:
+            await self.answer_ask_user(text)
+            return
+
         await self.emit(type="turn_start", text=text)
         await self.emit(type="chat", role="user", text=text)
 
-        # A chat message while paused does not resume the parked thread. It
-        # starts a new turn; the old pause stays in the checkpointer but is no
-        # longer the one this session will confirm.
-        self.paused_thread_id = None
-        self.paused_payload = None
+        # The gate stays open while they talk. What they ask for now is about
+        # the layout it is showing, so the planner is told which one that is and
+        # the revision it writes is folded back into the gate below.
         self._begin_fresh_turn()
+        gate = self._gate_context()
+        self.casper.report_config_gate = gate
+        if gate:
+            # What the planner is about to be told it is looking at. Worth
+            # seeing: an answer about the selected type comes from this and
+            # nothing else.
+            await self.emit(
+                type="gate_context", report_tier=gate.get("report_tier", ""),
+                report_title=gate.get("report_title", ""),
+                layout_chars=len(gate.get("markdown", "")),
+            )
 
         self.casper.user_previous_messages = list(self.history)
         gs = await self.casper.get_processing_state(text)
@@ -687,15 +796,115 @@ class HarnessSession:
 
         await self._drain_stream(gs, persist_history=True)
 
+    def _gate_context(self) -> dict:
+        """What the planner needs to know about the open gate."""
+        if not self.paused_thread_id or not self.paused_payload:
+            return {}
+        tier = self.gate_tier or self.paused_payload.get("default_tier") or "study"
+        layout = self._gate_layout(tier)
+        return {
+            "open": True,
+            "report_tier": tier,
+            "markdown": layout.get("markdown", ""),
+            "report_title": layout.get("report_title", ""),
+        }
+
+    def _gate_layout(self, tier: str) -> dict:
+        pair = (self.paused_payload or {}).get("report_layout_pair") or {}
+        if tier in pair:
+            return pair[tier] or {}
+        for entry in (self.paused_payload or {}).get("layouts") or []:
+            if entry.get("report_tier") == tier:
+                return entry
+        return {}
+
+    async def select_gate_tier(self, tier: str):
+        """The page toggled the gate. Everything said from here is about this one."""
+        if not self.paused_thread_id:
+            await self.emit(
+                type="error", message="This chat is not waiting for a report configuration."
+            )
+            return
+        self.gate_tier = tier
+        self.casper.report_config_gate = self._gate_context()
+        await self.emit(type="gate_tier", report_tier=tier)
+        await self.emit(type="state", **self.state_dict())
+
+    async def _apply_layout_to_gate(self, evt: dict):
+        """Fold a revision into the gate: only the tier on the user's screen."""
+        if not self.paused_thread_id or not self.paused_payload:
+            return
+        tier = self.gate_tier or self.paused_payload.get("default_tier") or "study"
+        entry = dict(self._gate_layout(tier))
+        entry.update(
+            {
+                "report_tier": tier,
+                "report_title": evt.get("report_title") or entry.get("report_title", ""),
+                "markdown": evt.get("markdown") or entry.get("markdown", ""),
+                "report_layout": evt.get("report_layout") or entry.get("report_layout", []),
+            }
+        )
+        pair = dict(self.paused_payload.get("report_layout_pair") or {})
+        pair[tier] = entry
+        self.paused_payload["report_layout_pair"] = pair
+        self.paused_payload["layouts"] = [
+            entry if (l or {}).get("report_tier") == tier else l
+            for l in (self.paused_payload.get("layouts") or [])
+        ] or [entry]
+
+        # `retrieve` builds from the layout the user confirmed, so the parked
+        # call carries the revision too.
+        args = dict(self.paused_payload.get("retrieve_args") or {})
+        if entry.get("markdown"):
+            args["report_layout"] = entry["markdown"]
+        if entry.get("report_title"):
+            args["report_title"] = entry["report_title"]
+        self.paused_payload["retrieve_args"] = args
+
+        self.casper.report_config_gate = self._gate_context()
+        await self.emit(
+            type="report_config_updated", report_tier=tier,
+            title=entry.get("report_title", ""), cards=entry.get("report_layout", []),
+            markdown=entry.get("markdown", ""),
+        )
+
+    async def answer_ask_user(self, text: str):
+        """Carry the user's answer into the run that stopped for it."""
+        thread_id = self.awaiting_answer_thread
+        self.awaiting_answer_thread = None
+
+        await self.emit(type="turn_start", text=text)
+        await self.emit(type="chat", role="user", text=text)
+
+        self.casper.turn_thread_id = thread_id
+        # The tool re-runs from its first line on the way back in; without this
+        # it would show the user the same options again.
+        self.casper._resuming_ask_user = True
+        self.casper.user_previous_messages = list(self.history)
+
+        await self._drain_stream(
+            self.casper.resume_ask_user(text), persist_history=True, answer=text
+        )
+
     async def confirm_report_config(self, submission: dict):
-        """Resume the parked turn. The only thing that does."""
+        """Run the report the user just configured. The only thing that starts one.
+
+        Nothing is resumed: the turn that asked for the configuration ended. The
+        `retrieve` arguments it parked are replayed into the graph's tool step,
+        which is why this needs a thread of its own.
+        """
         if not self.paused_thread_id:
             await self.emit(
                 type="error", message="This chat is not waiting for a report configuration."
             )
             return
 
-        self.casper.turn_thread_id = self.paused_thread_id
+        parked = dict(self.paused_payload or {})
+        # The gate's layouts are the edited ones, and its retrieve args carry the
+        # last revision, so the run builds what the user was looking at.
+        self.gate_tier = None
+        self._begin_fresh_turn()
+        self.casper.user_previous_messages = list(self.history)
         await self.emit(type="turn_start", text="(confirm report config)")
         await self.emit(
             type="chat",
@@ -704,7 +913,7 @@ class HarnessSession:
                  f"{submission.get('style', 'investor')}",
         )
 
-        gs = self.casper.resume_report_config(submission)
+        gs = self.casper.run_confirmed_report(parked, submission)
         self.paused_thread_id = None
         self.paused_payload = None
 
@@ -724,9 +933,8 @@ class HarnessSession:
 
     async def _run_report_in_background(self, gs):
         try:
-            # persist_history=False: the chat transcript belongs to the chat turns.
-            # The report's own graph messages must not clobber it, and a concurrent
-            # `respond_during_report` turn is writing to the same history.
+            # persist_history=False: the chat transcript belongs to the chat
+            # turns, and the report's own graph messages must not clobber it.
             await self._drain_stream(gs, persist_history=False, resume=True)
         except Exception as exc:
             await self.emit(
@@ -738,7 +946,9 @@ class HarnessSession:
             await self.emit(type="report_done")
             await self.emit(type="state", **self.state_dict())
 
-    async def _drain_stream(self, gs, *, persist_history: bool, resume: bool = False):
+    async def _drain_stream(
+        self, gs, *, persist_history: bool, resume: bool = False, answer: str | None = None
+    ):
         started = time.time()
         nodes_seen: list[str] = []
         edit_events = 0
@@ -747,8 +957,12 @@ class HarnessSession:
         cur_stream_node = None
         saw_propose = False
         emitted_updated = False
-        paused_for_report_config = False
+        awaiting_config = False
         pause_payload: dict | None = None
+        # `ask_user` is the only thing that interrupts now, so an interrupt on
+        # the way out means the run is holding for an answer.
+        interrupted = False
+        asked_options: list | None = None
 
         active_node = None
         last_model_activity = 0.0
@@ -795,7 +1009,7 @@ class HarnessSession:
                         type="node", node=node_name, elapsed=round(time.time() - started, 2)
                     )
                     if node_name == "__interrupt__":
-                        paused_for_report_config = True
+                        interrupted = True
 
             elif mode == "custom":
                 evt = _safe(output) if isinstance(output, dict) else {"value": _safe(output)}
@@ -822,8 +1036,59 @@ class HarnessSession:
                         cards=evt.get("report_layout", []), markdown=evt.get("markdown", ""),
                     )
                 elif name == "report_config" and status == "awaiting_configuration":
-                    paused_for_report_config = True
+                    awaiting_config = True
                     pause_payload = evt
+                elif name in (
+                    "proposed_report_layout_start",
+                    "proposed_report_layout_card",
+                    "proposed_report_layout_end",
+                ):
+                    # The layout streaming in card by card while the model is
+                    # still writing the tool call. `propose_report_layout` below
+                    # lands a moment later with the authoritative version and
+                    # replaces whatever this preview built.
+                    await self.emit(
+                        type="layout_stream",
+                        phase=name.removeprefix("proposed_report_layout_"),
+                        proposal_id=evt.get("proposal_id", ""),
+                        index=evt.get("index", 0),
+                        card=evt.get("card", {}),
+                        title=evt.get("report_title", ""),
+                        aborted=evt.get("aborted", False),
+                        # How far into the turn each card appeared — the whole
+                        # point of the preview is that this is far below the
+                        # time the finished layout lands.
+                        elapsed=round(time.time() - started, 2),
+                    )
+                elif name == "propose_report_layout" and status.startswith("layout_"):
+                    # caspr-core: the tool streams its own structured-output
+                    # call, brief-card style -- title, then each whole section
+                    # the moment its JSON object closes, then the full layout.
+                    saw_propose = saw_propose or status == "layout_stream_complete"
+                    await self._forward_core_layout_event(evt, status, started)
+                elif name in (
+                    "updated_proposed_report_layout_start",
+                    "updated_proposed_report_layout_card",
+                    "updated_proposed_report_layout_end",
+                ):
+                    # The web refresh streaming in. Its cards carry the proposal's
+                    # own indexes, so the page swaps card N in place and the web
+                    # version takes over one section at a time. `aborted` means
+                    # put the proposal back; `updated_proposed_report_layout`
+                    # below then lands with the authoritative version.
+                    await self.emit(
+                        type="layout_refresh_stream",
+                        phase=name.removeprefix("updated_proposed_report_layout_"),
+                        proposal_id=evt.get("proposal_id", ""),
+                        replaces=evt.get("replaces", ""),
+                        index=evt.get("index", 0),
+                        card=evt.get("card", {}),
+                        cards=evt.get("cards", 0),
+                        title=evt.get("report_title", ""),
+                        change_summary=evt.get("change_summary", ""),
+                        aborted=evt.get("aborted", False),
+                        elapsed=round(time.time() - started, 2),
+                    )
                 elif name in ("propose_report_layout", "updated_proposed_report_layout") \
                         and "report_layout" in evt:
                     is_upd = name == "updated_proposed_report_layout"
@@ -846,8 +1111,14 @@ class HarnessSession:
                     await self.emit(
                         type="layout_refresh", status="done" if is_upd else "running"
                     )
+                    if self.paused_thread_id:
+                        # The layout the gate is showing was just revised. Fold it
+                        # in, so the panel re-renders and a Confirm builds what the
+                        # user can see.
+                        await self._apply_layout_to_gate(evt)
                 elif name == "ask_user" and status == "options":
-                    await self.emit(type="ask_user", questions=evt.get("questions", []) or [])
+                    asked_options = evt.get("questions", []) or []
+                    await self.emit(type="ask_user", questions=asked_options)
                 elif name == "retrieve" and "report_layout" in evt:
                     await self.emit(
                         type="final_layout", markdown=evt.get("report_layout", ""),
@@ -871,17 +1142,40 @@ class HarnessSession:
                     data={"count": len(msgs), "messages": [_msg_digest(m) for m in msgs]},
                 )
 
-        if paused_for_report_config:
+        if interrupted and asked_options is not None:
+            # The run is holding on the question. Park the thread for the next
+            # message and save a readable copy of what was asked — the pending
+            # tool call stripped, the question kept — so the page can reload.
+            self.awaiting_answer_thread = self.casper.turn_thread_id
+            if persist_history:
+                try:
+                    snapshot = await self.casper.pending_ask_user_snapshot()
+                except Exception:
+                    snapshot = None
+                self._remember(snapshot or final_messages)
+            _total = time.time() - started
+            await self.emit(
+                type="turn_end", handled_by="ask_user", path=nodes_seen,
+                edit_events=edit_events, paused=True,
+                elapsed=round(_total, 2),
+                model_seconds=round(last_model_activity, 2),
+                waiting_seconds=round(max(0.0, _total - last_model_activity), 2),
+            )
+            await self.emit(type="state", **self.state_dict())
+            return
+
+        if awaiting_config:
             payload = pause_payload or {
                 "thread_id": self.casper.turn_thread_id, "default_tier": "study",
                 "tiers": ["study", "brief"], "styles": ["investor"], "layouts": [],
             }
             self.paused_thread_id = payload.get("thread_id") or self.casper.turn_thread_id
             self.paused_payload = payload
-            # A paused turn still happened. Without this the pause path returns
-            # before `_remember`, so if the user types a chat message instead of
-            # confirming, the next turn is rebuilt from a history that never saw
-            # this exchange — the conversation appears to lose its topic.
+            self.gate_tier = payload.get("selected_tier") or payload.get("default_tier") or "study"
+            # The turn ended for real — `report_config` dropped the unanswered
+            # retrieve call — so it is saved like any other. Without this, a chat
+            # message instead of a Confirm rebuilds the next turn from a history
+            # that never saw this exchange, and the conversation loses its topic.
             if persist_history:
                 self._remember(final_messages)
             await self.emit(type="report_config_required", **payload)
@@ -907,9 +1201,7 @@ class HarnessSession:
                     type="chat", role="assistant", text=body, node=cur_stream_node or ""
                 )
 
-        entry = next(
-            (n for n in nodes_seen if n in ("respond_during_report", "report_or_respond")), "?"
-        )
+        entry = "report_or_respond" if "report_or_respond" in nodes_seen else "?"
         if resume and entry == "?":
             entry = "report_config"
         _total = time.time() - started
@@ -921,7 +1213,7 @@ class HarnessSession:
         )
 
         if persist_history:
-            self._remember(final_messages)
+            self._remember(final_messages, answer=answer)
         await self.emit(type="state", **self.state_dict())
 
         # The web refresh of a proposed layout runs as a background task. The
@@ -943,10 +1235,16 @@ class HarnessSession:
                 self._layout_watch = asyncio.create_task(self._watch_layout_refresh(task))
 
     # -- refine request routing -----------------------------------------
-    def _ensure_refine_router(self) -> RefineRequestRouter:
+    def _ensure_refine_router(self):
         """One router per report. Its own writer is a graph-run stream writer,
         which does not resolve here — we call it outside any graph — so it is
-        handed a plain collector the session drains."""
+        handed a plain collector the session drains.
+
+        Returns None where the capturer is commented out in core, which is where
+        this checkout stands: nothing feeds it, so nothing tracks cards.
+        """
+        if RefineRequestRouter is None:
+            return None
         if self.refine_router is None:
             self.refine_router = RefineRequestRouter(
                 chat_id=self.casper.chat_id,
@@ -963,8 +1261,13 @@ class HarnessSession:
         Cheap: a local MemorySaver graph step, no LLM. `parse_card_event`
         ignores status/heartbeat frames itself.
         """
+        router = self._ensure_refine_router()
+        if router is None:
+            # The capturer is commented out in core, so there is nothing to
+            # track cards for and nothing to report about it.
+            return
         try:
-            await self._ensure_refine_router().ingest_card_event(evt)
+            await router.ingest_card_event(evt)
         except Exception as exc:
             # Surface it: a silently untracked card means a later edit request
             # cannot be routed to that section, which is exactly the kind of
@@ -987,6 +1290,8 @@ class HarnessSession:
 
     async def _route_edit_request(self, evt: dict) -> None:
         router = self._ensure_refine_router()
+        if router is None:
+            return
         await self.emit(type="refine_routing", request=evt.get("request"))
         try:
             await router.handle_post_report_edit_request(evt)
@@ -1028,6 +1333,52 @@ class HarnessSession:
                 type="refine_request", entry=entry, queue_len=len(self.refine_queue)
             )
             await self.emit(type="state", **self.state_dict())
+
+    async def _forward_core_layout_event(self, evt: dict, status: str, started: float):
+        """caspr-core's `propose_report_layout` events, as the page's layout messages.
+
+        Sections become the same card shape `cardsNode` already renders, so the
+        live preview and the final proposal reuse the existing layout pane.
+        """
+        elapsed = round(time.time() - started, 2)
+        if status == "layout_stream_start":
+            self._core_proposal_seq = getattr(self, "_core_proposal_seq", 0) + 1
+            await self.emit(
+                type="layout_stream", phase="start",
+                proposal_id=f"core-{self._core_proposal_seq}",
+                report_type=evt.get("report_type", ""),
+                domain_name=evt.get("domain_name", ""),
+                message=evt.get("message", ""), elapsed=elapsed,
+            )
+            return
+        proposal_id = f"core-{getattr(self, '_core_proposal_seq', 0)}"
+        if status == "layout_title":
+            await self.emit(
+                type="layout_stream", phase="title", proposal_id=proposal_id,
+                title=evt.get("title", ""), elapsed=elapsed,
+            )
+        elif status == "layout_section":
+            await self.emit(
+                type="layout_stream", phase="card", proposal_id=proposal_id,
+                index=evt.get("index", 0), card=_core_section_card(evt.get("section") or {}),
+                section=evt.get("section") or {}, elapsed=elapsed,
+            )
+        elif status == "layout_stream_failed":
+            await self.emit(
+                type="layout_stream", phase="end", proposal_id=proposal_id,
+                aborted=True, message=evt.get("message", ""), elapsed=elapsed,
+            )
+        elif status == "layout_stream_complete":
+            layout = evt.get("layout") or {}
+            sections = layout.get("sections") or []
+            await self.emit(
+                type="layout_stream", phase="end", proposal_id=proposal_id,
+                title=layout.get("title", ""), elapsed=elapsed,
+            )
+            await self.emit(
+                type="layout_proposal", updated=False, title=layout.get("title", ""),
+                cards=[_core_section_card(s) for s in sections], layout=layout,
+            )
 
     def _cards_from_updated(self, updated) -> list:
         """Card list for a ``updated_proposed_report_layout`` object.
@@ -1200,13 +1551,52 @@ class HarnessSession:
         return out
 
 
+# ── the user memory Casper is built with ───────────────────────────────────
+# What Caspr has learned about the user across their chats. It sets the chat
+# tone and the default report audience (`profile.audience`), so the harness
+# loads it exactly the way the API layer is meant to: one JSON file, passed in
+# as `user_memory`. `CASPR_USER_MEMORY=off` runs without one.
+_MEMORY_ENV = os.environ.get("CASPR_USER_MEMORY", "")
+_MEMORY_PATH = (
+    None
+    if _MEMORY_ENV.strip().lower() in {"off", "none", "0"}
+    else Path(_MEMORY_ENV or _CASPR_CORE / "tests" / "fixtures" / "sample_user_memory.json")
+)
+
+
+def load_user_memory() -> tuple[dict | list, dict]:
+    """The memory to build Casper with, and what the page shows about it."""
+    if _MEMORY_PATH is None:
+        return {}, {"path": "", "state": "off"}
+    try:
+        memory = json.loads(_MEMORY_PATH.read_text())
+    except FileNotFoundError:
+        return {}, {"path": str(_MEMORY_PATH), "state": "missing"}
+    except ValueError as exc:
+        return {}, {"path": str(_MEMORY_PATH), "state": f"invalid json: {exc}"}
+    profile = memory.get("profile") if isinstance(memory, dict) else None
+    audience = (profile or {}).get("audience") if isinstance(profile, dict) else None
+    return memory, {
+        "path": str(_MEMORY_PATH),
+        "state": "loaded",
+        "audience": audience or "(none)",
+        "keys": list(memory) if isinstance(memory, dict) else [],
+    }
+
+
 # ── build the real Casper (nothing stubbed) ────────────────────────────────
 async def build_casper():
+    memory, _ = load_user_memory()
     cfg = {
         "user_name": "harness",
         "chat_id": "harness-chat-1",
         "user_previous_messages": [],
         "user_id": "harness-user",
+        # caspr-core checks the local wallet before binding tools, and the
+        # harness user has none: without this every turn runs with no tools,
+        # so `propose_report_layout` could never be called.
+        "billing_is_external": True,
+        "user_memory": memory,
     }
     casper = Casper(cfg)
     await casper.async_init()
@@ -1249,7 +1639,8 @@ async def ws_endpoint(ws: WebSocket):
     h.install_layout_hook()
     h.set_report_in_progress(False)
     await send({"type": "ready", "sample_layout": SAMPLE_LAYOUT,
-                "catalog": build_catalog(casper), "caspr_core": str(_CASPR_CORE)})
+                "catalog": build_catalog(casper), "caspr_core": str(_CASPR_CORE),
+                "split_agent": SPLIT_AGENT, "user_memory": load_user_memory()[1]})
     await send({"type": "state", **h.state_dict()})
 
     async def guard(coro):
@@ -1297,6 +1688,10 @@ async def ws_endpoint(ws: WebSocket):
                             }
                         )
                     )
+                elif kind == "select_gate_tier":
+                    await guard(
+                        h.select_gate_tier((msg.get("report_tier") or "study").strip().lower())
+                    )
                 elif kind == "report_on":
                     h.set_report_in_progress(True, (msg.get("title") or "").strip() or None)
                     await send({"type": "state", **h.state_dict()})
@@ -1316,6 +1711,8 @@ async def ws_endpoint(ws: WebSocket):
                     h.history = []
                     h.paused_thread_id = None
                     h.paused_payload = None
+                    h.awaiting_answer_thread = None
+                    h.gate_tier = None
                     h._begin_fresh_turn()
                     await send({"type": "reset_done"})
                     await send({"type": "state", **h.state_dict()})
@@ -1327,7 +1724,8 @@ async def ws_endpoint(ws: WebSocket):
                 elif kind == "refine_queue":
                     await send({"type": "refine_queue", "queue": h.refine_queue})
                 elif kind == "refine_cards":
-                    cards = await h._ensure_refine_router().tracked_cards()
+                    router = h._ensure_refine_router()
+                    cards = await router.tracked_cards() if router is not None else []
                     await send({"type": "refine_cards", "cards": _safe(cards)})
                 elif kind == "catalog":
                     await send({"type": "catalog", "catalog": build_catalog(casper)})
@@ -1349,5 +1747,12 @@ if __name__ == "__main__":
     host = os.environ.get("HARNESS_HOST", "127.0.0.1")
     port = int(os.environ.get("HARNESS_PORT", "8765"))
     print(f"\n  caspr agent harness → http://{host}:{port}")
-    print(f"  caspr core          → {_CASPR_CORE}\n")
+    print(f"  caspr core          → {_CASPR_CORE}")
+    _mem = load_user_memory()[1]
+    print(
+        f"  user memory         → {_mem['state']}"
+        + (f" ({_mem['audience']}) {_mem['path']}" if _mem["state"] == "loaded" else
+           f" {_mem['path']}" if _mem["path"] else "")
+        + "\n"
+    )
     uvicorn.run(app, host=host, port=port, log_level="warning")
